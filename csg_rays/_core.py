@@ -31,6 +31,9 @@ from fractions import Fraction
 from ._exact import Root, cmp_tval, frac_to_decimal, sorted_unique, tval_to_float
 from ._types import (
     MAX_TREE_NODES,
+    ORIENT_BACK,
+    ORIENT_FRONT,
+    ORIENT_GRAZING,
     Boundary,
     Box,
     Difference,
@@ -567,6 +570,39 @@ def ray_intervals(tree, ray):
     )
 
 
+def _face_orientation(leaf, face, kind, tval, origin, direction):
+    """Classify a face against the ray direction from the leaf's own outward
+    normal (before any Difference flip), using exact arithmetic.
+
+    Returns one of ORIENT_FRONT / ORIENT_BACK / ORIENT_GRAZING according to
+    the sign of the outward-normal . ray-direction product.
+    """
+    if isinstance(leaf, Box):
+        axis = "xyz".index(face[0])
+        sign = -1 if face.endswith("_lo") else +1
+        dot = sign * direction[axis]  # axis-aligned unit normal . direction
+    else:  # Sphere
+        if kind == "touch":
+            # A sphere touch is the tangent point; the tangent normal is
+            # exactly perpendicular to the ray.
+            return ORIENT_GRAZING
+        if isinstance(tval, Fraction):
+            # Outward (not necessarily unit) radial vector at the hit point.
+            dot = Fraction(0)
+            for i in range(3):
+                radial_i = origin[i] + tval * direction[i] - leaf.center[i]
+                dot += radial_i * direction[i]
+        else:
+            # Irrational quadratic root: a transversal crossing is never
+            # grazing; the smaller root is the entry face, larger the exit.
+            return ORIENT_FRONT if kind == "enter" else ORIENT_BACK
+    if dot < 0:
+        return ORIENT_FRONT
+    if dot > 0:
+        return ORIENT_BACK
+    return ORIENT_GRAZING
+
+
 def _make_source(leaf, face, kind, tval, origin, direction, polarity):
     if isinstance(leaf, Sphere):
         normal = _sphere_normal(leaf, origin, direction, tval)
@@ -575,6 +611,9 @@ def _make_source(leaf, face, kind, tval, origin, direction, polarity):
     flipped = polarity < 0
     if flipped:
         normal = tuple(-component for component in normal)
+    orientation = _face_orientation(
+        leaf, face, kind, tval, origin, direction
+    )
     return Source(
         leaf_id=leaf.leaf_id,
         face=face,
@@ -582,4 +621,6 @@ def _make_source(leaf, face, kind, tval, origin, direction, polarity):
         # "+ 0.0" normalizes -0.0 produced by flipping zero components
         normal=tuple(float(component) + 0.0 for component in normal),
         flipped=flipped,
+        material=leaf.material,
+        orientation=orientation,
     )

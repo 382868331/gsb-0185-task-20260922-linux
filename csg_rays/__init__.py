@@ -17,6 +17,9 @@ See README.md for the full contract, limits and error policy.
 from ._core import ray_intervals
 from ._types import (
     MAX_TREE_NODES,
+    ORIENT_BACK,
+    ORIENT_FRONT,
+    ORIENT_GRAZING,
     Boundary,
     Box,
     CertificationBudgetExhausted,
@@ -35,6 +38,9 @@ from ._types import (
 
 __all__ = [
     "MAX_TREE_NODES",
+    "ORIENT_BACK",
+    "ORIENT_FRONT",
+    "ORIENT_GRAZING",
     "Boundary",
     "Box",
     "CertificationBudgetExhausted",
@@ -52,4 +58,4 @@ __all__ = [
     "ray_intervals",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -24,6 +24,15 @@ from fractions import Fraction
 #: Maximum number of nodes (leaves + internal nodes) accepted in a CSG tree.
 MAX_TREE_NODES = 100
 
+#: Face orientation relative to the ray direction, classified from the
+#: leaf's own geometric outward normal (before any Difference flip):
+#: front = normal points against the ray (the face the ray hits first),
+#: back = normal points along the ray, grazing = normal perpendicular to the
+#: ray (tangent point / face-riding contact).
+ORIENT_FRONT = "front"
+ORIENT_BACK = "back"
+ORIENT_GRAZING = "grazing"
+
 
 class CSGError(ValueError):
     """Base class for all errors raised by csg_rays."""
@@ -79,6 +88,15 @@ def _as_leaf_id(value, path):
     return value
 
 
+def _as_material(value, path):
+    """Material id is optional: None (unassigned) or a non-empty str."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str) or not value:
+        raise GeometryError(f"{path}: material must be None or a non-empty str")
+    return value
+
+
 def _is_node(value):
     return isinstance(value, (Sphere, Box, Union, Intersection, Difference))
 
@@ -106,11 +124,16 @@ def _check_children(children, path):
 
 @dataclass(frozen=True)
 class Sphere:
-    """Solid sphere leaf.  ``center``/``radius`` are stored as exact Fractions."""
+    """Solid sphere leaf.  ``center``/``radius`` are stored as exact Fractions.
+
+    ``material`` is an optional non-empty material id (``None`` if
+    unassigned); it is carried onto every emitted :class:`Source`.
+    """
 
     center: object
     radius: object
     leaf_id: str
+    material: object = None
 
     def __post_init__(self):
         path = f"Sphere(leaf_id={self.leaf_id!r})"
@@ -120,15 +143,21 @@ class Sphere:
         if radius <= 0:
             raise GeometryError(f"{path}.radius: must be > 0, got {self.radius!r}")
         object.__setattr__(self, "radius", radius)
+        object.__setattr__(self, "material", _as_material(self.material, f"{path}.material"))
 
 
 @dataclass(frozen=True)
 class Box:
-    """Axis-aligned solid box leaf.  ``mins[i] < maxs[i]`` is required."""
+    """Axis-aligned solid box leaf.  ``mins[i] < maxs[i]`` is required.
+
+    ``material`` is an optional non-empty material id (``None`` if
+    unassigned); it is carried onto every emitted :class:`Source`.
+    """
 
     mins: object
     maxs: object
     leaf_id: str
+    material: object = None
 
     def __post_init__(self):
         path = f"Box(leaf_id={self.leaf_id!r})"
@@ -143,6 +172,7 @@ class Box:
                 )
         object.__setattr__(self, "mins", mins)
         object.__setattr__(self, "maxs", maxs)
+        object.__setattr__(self, "material", _as_material(self.material, f"{path}.material"))
 
 
 @dataclass(frozen=True)
@@ -238,6 +268,13 @@ class Source:
     leaf acts as a subtractor inside :class:`Difference` (``flipped`` is then
     True).  ``kind`` is the leaf-side event kind: ``"enter"``, ``"exit"`` or
     ``"touch"`` (tangential / face-riding contact).
+
+    ``material`` is the source leaf's material id (``None`` if unassigned).
+    ``orientation`` classifies the face against the ray direction from the
+    leaf's own geometric outward normal (before the Difference flip):
+    ``"front"`` (normal . direction < 0, the face the ray enters through),
+    ``"back"`` (> 0) or ``"grazing"`` (== 0, tangent / face-riding).  It is
+    independent of ``flipped``.
     """
 
     leaf_id: str
@@ -245,6 +282,8 @@ class Source:
     kind: str
     normal: tuple
     flipped: bool
+    material: object = None
+    orientation: str = "front"
 
 
 @dataclass(frozen=True)
