@@ -20,9 +20,16 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from fractions import Fraction
+from types import MappingProxyType
 
 #: Maximum number of nodes (leaves + internal nodes) accepted in a CSG tree.
 MAX_TREE_NODES = 100
+
+#: Material id assigned to a primitive surface when the caller overrides none.
+DEFAULT_MATERIAL = "default"
+
+#: The six axis-aligned box surface names (valid ``face_materials`` keys).
+BOX_FACES = ("x_lo", "x_hi", "y_lo", "y_hi", "z_lo", "z_hi")
 
 
 class CSGError(ValueError):
@@ -79,6 +86,49 @@ def _as_leaf_id(value, path):
     return value
 
 
+def _as_material_id(value, path):
+    if isinstance(value, bool) or not isinstance(value, str) or not value:
+        raise GeometryError(f"{path}: material id must be a non-empty str")
+    return value
+
+
+def _resolve_materials(material, face_materials, faces, path):
+    """Build the immutable ``{face: material_id}`` map of a primitive.
+
+    ``material`` is the primitive-wide default; ``face_materials`` optionally
+    overrides individual named faces.  Every surface (one face for a sphere,
+    six for a box) ends up with a non-empty string material id.  Unknown face
+    keys are rejected rather than silently ignored, so a typo can never leave
+    a surface half-configured.
+    """
+    default = _as_material_id(material, f"{path}.material")
+    if face_materials is None:
+        overrides = {}
+    else:
+        if isinstance(face_materials, (str, bytes)) or not hasattr(
+            face_materials, "items"
+        ):
+            raise GeometryError(
+                f"{path}.face_materials: expected a mapping of face names to "
+                f"material ids, got {type(face_materials).__name__}"
+            )
+        overrides = dict(face_materials)
+    allowed = set(faces)
+    for face in overrides:
+        if face not in allowed:
+            raise GeometryError(
+                f"{path}.face_materials: unknown face {face!r}; "
+                f"valid faces are {', '.join(faces)}"
+            )
+    resolved = {face: default for face in faces}
+    for face, mat in overrides.items():
+        resolved[face] = _as_material_id(mat, f"{path}.face_materials[{face!r}]")
+    # a sorted tuple of pairs: value-based and hashable, so frozen primitive
+    # nodes stay comparable and usable as dict/set members even with overrides
+    stored = tuple(sorted(overrides.items())) or None
+    return MappingProxyType(resolved), stored
+
+
 def _is_node(value):
     return isinstance(value, (Sphere, Box, Union, Intersection, Difference))
 
@@ -106,11 +156,19 @@ def _check_children(children, path):
 
 @dataclass(frozen=True)
 class Sphere:
-    """Solid sphere leaf.  ``center``/``radius`` are stored as exact Fractions."""
+    """Solid sphere leaf.  ``center``/``radius`` are stored as exact Fractions.
+
+    ``material`` is the material id of the sphere surface (default
+    :data:`DEFAULT_MATERIAL`).  ``face_materials`` is an optional mapping and
+    only accepts the key ``"sphere"``; it is kept for interface symmetry with
+    :class:`Box`.  The resolved per-face map is exposed as ``materials``.
+    """
 
     center: object
     radius: object
     leaf_id: str
+    material: str = DEFAULT_MATERIAL
+    face_materials: object = None
 
     def __post_init__(self):
         path = f"Sphere(leaf_id={self.leaf_id!r})"
@@ -120,15 +178,30 @@ class Sphere:
         if radius <= 0:
             raise GeometryError(f"{path}.radius: must be > 0, got {self.radius!r}")
         object.__setattr__(self, "radius", radius)
+        materials, overrides = _resolve_materials(
+            self.material, self.face_materials, ("sphere",), path
+        )
+        object.__setattr__(self, "face_materials", overrides)
+        object.__setattr__(self, "materials", materials)
+        object.__setattr__(
+            self, "material", _as_material_id(self.material, f"{path}.material")
+        )
 
 
 @dataclass(frozen=True)
 class Box:
-    """Axis-aligned solid box leaf.  ``mins[i] < maxs[i]`` is required."""
+    """Axis-aligned solid box leaf.  ``mins[i] < maxs[i]`` is required.
+
+    ``material`` is the material id used for every face unless overridden via
+    ``face_materials``, a mapping from face names (``"x_lo"`` ... ``"z_hi"``)
+    to material ids.  The resolved per-face map is exposed as ``materials``.
+    """
 
     mins: object
     maxs: object
     leaf_id: str
+    material: str = DEFAULT_MATERIAL
+    face_materials: object = None
 
     def __post_init__(self):
         path = f"Box(leaf_id={self.leaf_id!r})"
@@ -143,6 +216,12 @@ class Box:
                 )
         object.__setattr__(self, "mins", mins)
         object.__setattr__(self, "maxs", maxs)
+        materials, overrides = _resolve_materials(
+            self.material, self.face_materials, BOX_FACES, path
+        )
+        object.__setattr__(self, "face_materials", overrides)
+        object.__setattr__(self, "materials", materials)
+        object.__setattr__(self, "material", _as_material_id(self.material, f"{path}.material"))
 
 
 @dataclass(frozen=True)
@@ -233,11 +312,31 @@ class Source:
     """One face of one leaf participating in a boundary or touch.
 
     ``face`` is ``"sphere"`` for spheres and one of ``"x_lo"``, ``"x_hi"``,
-    ``"y_lo"``, ``"y_hi"``, ``"z_lo"``, ``"z_hi"`` for boxes.  ``normal`` is
-    the outward unit normal of that face at the hit point, flipped when the
-    leaf acts as a subtractor inside :class:`Difference` (``flipped`` is then
-    True).  ``kind`` is the leaf-side event kind: ``"enter"``, ``"exit"`` or
+    ``"y_lo"``, ``"y_hi"``, ``"z_lo"``, ``"z_hi"`` for boxes.  ``material`` is
+    the material id assigned to that primitive surface (default
+    :data:`DEFAULT_MATERIAL`; per-face overrides come from
+    ``Sphere/Box(..., face_materials=...)``).
+
+    ``kind`` is the leaf-side event kind: ``"enter"``, ``"exit"`` or
     ``"touch"`` (tangential / face-riding contact).
+
+    ``normal`` is the geometric outward unit normal of that face at the hit
+    point, flipped when the leaf acts as a subtractor inside
+    :class:`Difference` (``flipped`` is then True).
+
+    ``orientation`` records the direction the surface was authored with and
+    never changes under Boolean composition: ``"outward"`` for a positive
+    primitive, ``"inward"`` for a surface reached through an odd number of
+    subtractor positions (the cavity wall of a difference).  Nested
+    differences toggle it again: the positive of a difference nested inside a
+    subtractor is authored inward, and its own subtractors toggle back to
+    outward.  Note the distinction: ``orientation`` is the authored facing
+    (parity of subtractor nesting), while ``flipped`` says whether the
+    geometric ``normal`` was negated.  For ordinary boundaries they coincide;
+    at a tangent contact on an inward-authored subtractor face the surface
+    keeps its inward orientation but the reported normal is the outward one
+    (the contact does not become a cavity wall), so ``flipped`` is False while
+    ``orientation == "inward"``.
     """
 
     leaf_id: str
@@ -245,6 +344,8 @@ class Source:
     kind: str
     normal: tuple
     flipped: bool
+    material: str = DEFAULT_MATERIAL
+    orientation: str = "outward"
 
 
 @dataclass(frozen=True)

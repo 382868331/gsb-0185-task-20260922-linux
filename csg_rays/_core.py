@@ -456,8 +456,12 @@ def ray_intervals(tree, ray):
             final_pt[i] = _SOLID
 
     # -- source collection --------------------------------------------------
-    def sources_at(ci):
-        """All leaf faces at cluster ci whose state matters to the result."""
+    def boundary_sources_at(ci):
+        """Faces causing the solid transition at cluster ci.
+
+        A leaf face matters iff forcing that leaf to IN (or to OUT) on the two
+        open segments flanking ci changes the Boolean result there.
+        """
         found = []
         for li, leaf in enumerate(leaves):
             events = leaf_events_at[li].get(ci)
@@ -474,6 +478,40 @@ def ray_intervals(tree, ray):
                         _make_source(
                             leaf, face, source_kind, clusters[ci],
                             origin, direction, polarities[li],
+                            as_wall=True,
+                        )
+                    )
+        found.sort(key=lambda s: (s.leaf_id, s.face))
+        return found
+
+    def touch_sources_at(ci):
+        """Faces causing the zero-measure contact at cluster ci.
+
+        A contact lives on point/riding states (leaf value T), so the
+        counterfactual is evaluated at the point cluster: a leaf face matters
+        iff forcing that leaf's point state to IN or to OUT changes the Boolean
+        result at the contact point.  This is what attributes, for example,
+        the tangential face of a subtractor that creates a contact inside
+        ``Difference(IN-positive, tangent-subtractor)`` -- a case the
+        segment-only test could not see.  Such a contact is not a cavity wall,
+        so the geometric normal is reported as authored (as_wall=False).
+        """
+        baseline = pt_state(ci)
+        found = []
+        for li, leaf in enumerate(leaves):
+            events = leaf_events_at[li].get(ci)
+            if not events:
+                continue
+            if pt_state(ci, (li, _IN)) == baseline and pt_state(ci, (li, _OUT)) == baseline:
+                continue  # the contact does not depend on this leaf event
+            for kind, faces in events:
+                source_kind = kind if kind in ("enter", "exit") else "touch"
+                for face in faces:
+                    found.append(
+                        _make_source(
+                            leaf, face, source_kind, clusters[ci],
+                            origin, direction, polarities[li],
+                            as_wall=False,
                         )
                     )
         found.sort(key=lambda s: (s.leaf_id, s.face))
@@ -491,7 +529,7 @@ def ray_intervals(tree, ray):
             kind = "exit"
         else:
             continue
-        sources = sources_at(ci)
+        sources = boundary_sources_at(ci)
         if not sources:
             raise GeometryError(  # unreachable: a transition needs a cause
                 f"internal error: boundary at cluster {ci} has no source"
@@ -532,7 +570,7 @@ def ray_intervals(tree, ray):
     for left_cluster, right_cluster in touch_runs:
         merged = []
         for ci in range(left_cluster, right_cluster + 1):
-            merged.extend(sources_at(ci))
+            merged.extend(touch_sources_at(ci))
         merged.sort(key=lambda s: (s.leaf_id, s.face, s.kind))
         unique = []
         seen = set()
@@ -541,6 +579,11 @@ def ray_intervals(tree, ray):
             if key not in seen:
                 seen.add(key)
                 unique.append(source)
+        if not unique:
+            raise GeometryError(  # unreachable: an emitted contact has a cause
+                f"internal error: touch run {left_cluster}..{right_cluster} "
+                f"has no source"
+            )
         touches.append(
             Touch(
                 t0=tval_to_float(clusters[left_cluster]),
@@ -567,12 +610,19 @@ def ray_intervals(tree, ray):
     )
 
 
-def _make_source(leaf, face, kind, tval, origin, direction, polarity):
+def _make_source(leaf, face, kind, tval, origin, direction, polarity, as_wall):
     if isinstance(leaf, Sphere):
         normal = _sphere_normal(leaf, origin, direction, tval)
     else:
         normal = _BOX_NORMALS[face]
-    flipped = polarity < 0
+    material = leaf.materials[face]
+    # Authored facing: an odd number of subtractor positions makes the surface
+    # an inward-facing cavity wall; nested differences toggle by parity.
+    orientation = "inward" if polarity < 0 else "outward"
+    # The geometric normal is negated only when the surface actually bounds a
+    # cavity (a solid boundary).  At an empty-flanked tangential contact the
+    # authored outward normal is reported even for a subtractor leaf.
+    flipped = as_wall and polarity < 0
     if flipped:
         normal = tuple(-component for component in normal)
     return Source(
@@ -582,4 +632,6 @@ def _make_source(leaf, face, kind, tval, origin, direction, polarity):
         # "+ 0.0" normalizes -0.0 produced by flipping zero components
         normal=tuple(float(component) + 0.0 for component in normal),
         flipped=flipped,
+        material=material,
+        orientation=orientation,
     )

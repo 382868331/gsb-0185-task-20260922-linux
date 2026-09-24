@@ -16,6 +16,8 @@ See README.md for the full contract, limits and error policy.
 
 from ._core import ray_intervals
 from ._types import (
+    BOX_FACES,
+    DEFAULT_MATERIAL,
     MAX_TREE_NODES,
     Boundary,
     Box,
@@ -34,6 +36,8 @@ from ._types import (
 )
 
 __all__ = [
+    "BOX_FACES",
+    "DEFAULT_MATERIAL",
     "MAX_TREE_NODES",
     "Boundary",
     "Box",
@@ -52,4 +56,4 @@ __all__ = [
     "ray_intervals",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
