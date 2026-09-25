@@ -2,8 +2,10 @@
 
 Public interface:
 
-* Tree nodes: :class:`Sphere`, :class:`Box` (leaves) and :class:`Union`,
-  :class:`Intersection`, :class:`Difference` (internal nodes).
+* Tree nodes: :class:`Sphere`, :class:`Box` (leaves), :class:`Union`,
+  :class:`Intersection`, :class:`Difference` (internal nodes) and
+  :class:`Instance` (one reference to an existing subtree under an
+  invertible affine transform).
 * :class:`Ray` and the entry point :func:`ray_intervals`.
 * Output: :class:`RayIntervalsResult` with :class:`Interval`, :class:`Touch`,
   :class:`Boundary` and :class:`Source`.
@@ -23,6 +25,7 @@ from ._types import (
     CSGError,
     Difference,
     GeometryError,
+    Instance,
     Intersection,
     Interval,
     Ray,
@@ -41,6 +44,7 @@ __all__ = [
     "CSGError",
     "Difference",
     "GeometryError",
+    "Instance",
     "Intersection",
     "Interval",
     "Ray",
@@ -52,4 +56,4 @@ __all__ = [
     "ray_intervals",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -80,7 +80,55 @@ def _as_leaf_id(value, path):
 
 
 def _is_node(value):
-    return isinstance(value, (Sphere, Box, Union, Intersection, Difference))
+    return isinstance(value, (Sphere, Box, Union, Intersection, Difference, Instance))
+
+
+def _as_node_id(value, path):
+    if isinstance(value, bool) or not isinstance(value, str) or not value:
+        raise GeometryError(f"{path}: must be a non-empty str")
+    return value
+
+
+def _as_matrix3(value, path):
+    """Validate a 3x3 numeric matrix; return 3 rows of Fraction triples."""
+    if isinstance(value, (str, bytes)):
+        raise GeometryError(f"{path}: expected a 3x3 matrix (3 rows of 3 numbers)")
+    try:
+        rows = tuple(value)
+    except TypeError:
+        raise GeometryError(
+            f"{path}: expected a 3x3 matrix, got {type(value).__name__}"
+        )
+    if len(rows) != 3:
+        raise GeometryError(f"{path}: expected 3 rows, got {len(rows)}")
+    return tuple(_as_vec3(row, f"{path}[{i}]") for i, row in enumerate(rows))
+
+
+def _mat3_det(m):
+    """Exact determinant of a Fraction 3x3 matrix."""
+    return (
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    )
+
+
+def _mat3_inverse(m):
+    """Exact inverse (adjugate / determinant) of a nonsingular Fraction 3x3."""
+    det = _mat3_det(m)
+
+    def minor(i, j):
+        rows = [r for r in range(3) if r != i]
+        cols = [c for c in range(3) if c != j]
+        return (
+            m[rows[0]][cols[0]] * m[rows[1]][cols[1]]
+            - m[rows[0]][cols[1]] * m[rows[1]][cols[0]]
+        )
+
+    return tuple(
+        tuple(((-1) ** (i + j)) * minor(j, i) / det for j in range(3))
+        for i in range(3)
+    )
 
 
 def _check_children(children, path):
@@ -206,6 +254,64 @@ class Difference:
 
 
 @dataclass(frozen=True)
+class Instance:
+    """Reference to an existing CSG subtree under an invertible affine transform.
+
+    ``Instance(child, matrix, translation, instance_id)`` places one
+    *reference* to ``child`` at ``matrix @ x + translation`` (the transform
+    maps the child's local coordinates to the coordinates of this node).  The
+    referenced subtree is shared, never copied or modified; several Instance
+    nodes may reference the same subtree object.  ``matrix`` must be a
+    nonsingular 3x3 matrix (singular matrices are rejected with
+    :class:`GeometryError`).  Reference cycles (a subtree that, directly or
+    transitively, references itself) are rejected by :func:`ray_intervals`.
+
+    ``matrix``/``translation`` are stored as exact Fractions; ``inverse`` is
+    the exact inverse matrix (Fractions), precomputed at construction.
+    """
+
+    child: object
+    matrix: object
+    translation: object
+    instance_id: str
+
+    def __post_init__(self):
+        path = f"Instance(instance_id={self.instance_id!r})"
+        object.__setattr__(
+            self, "instance_id", _as_node_id(self.instance_id, f"{path}.instance_id")
+        )
+        if not _is_node(self.child):
+            raise GeometryError(
+                f"{path}.child: not a CSG node ({type(self.child).__name__})"
+            )
+        matrix = _as_matrix3(self.matrix, f"{path}.matrix")
+        if _mat3_det(matrix) == 0:
+            raise GeometryError(
+                f"{path}.matrix: singular matrix (determinant is 0); "
+                f"the instance transform must be invertible"
+            )
+        object.__setattr__(self, "matrix", matrix)
+        object.__setattr__(
+            self, "translation", _as_vec3(self.translation, f"{path}.translation")
+        )
+        object.__setattr__(self, "inverse", _mat3_inverse(matrix))
+        inv = self.inverse
+        object.__setattr__(
+            self, "translation_inv",
+            tuple(
+                -sum(inv[i][j] * self.translation[j] for j in range(3))
+                for i in range(3)
+            ),
+        )
+
+    def __repr__(self):
+        return (
+            f"Instance(instance_id={self.instance_id!r}, "
+            f"child={type(self.child).__name__})"
+        )
+
+
+@dataclass(frozen=True)
 class Ray:
     """Ray ``origin + t * direction`` over the whole real line (t in R).
 
@@ -237,7 +343,12 @@ class Source:
     the outward unit normal of that face at the hit point, flipped when the
     leaf acts as a subtractor inside :class:`Difference` (``flipped`` is then
     True).  ``kind`` is the leaf-side event kind: ``"enter"``, ``"exit"`` or
-    ``"touch"`` (tangential / face-riding contact).
+    ``"touch"`` (tangential / face-riding contact).  ``leaf_id`` is the id of
+    the referenced leaf; ``path`` is the tuple of ``instance_id``s (outermost
+    first) of the :class:`Instance` references through which the leaf was
+    reached -- ``()`` for leaves placed directly in the tree, so two
+    instances of one shared subtree yield distinct sources for the same
+    original leaf.
     """
 
     leaf_id: str
@@ -245,6 +356,7 @@ class Source:
     kind: str
     normal: tuple
     flipped: bool
+    path: tuple = ()
 
 
 @dataclass(frozen=True)
