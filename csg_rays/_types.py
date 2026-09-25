@@ -21,8 +21,14 @@ import math
 from dataclasses import dataclass
 from fractions import Fraction
 
-#: Maximum number of nodes (leaves + internal nodes) accepted in a CSG tree.
+#: Maximum number of distinct declared nodes accepted in a CSG DAG.
 MAX_TREE_NODES = 100
+
+#: Maximum number of leaf occurrences produced after instance expansion.
+#: A DAG with at most 100 distinct nodes can still expand exponentially when
+#: a subtree references another shared subtree repeatedly; this cap bounds the
+#: actual sweep work independently of the declared-node budget.
+MAX_LEAF_OCCURRENCES = 2000
 
 
 class CSGError(ValueError):
@@ -80,7 +86,43 @@ def _as_leaf_id(value, path):
 
 
 def _is_node(value):
-    return isinstance(value, (Sphere, Box, Union, Intersection, Difference))
+    return isinstance(
+        value, (Sphere, Box, Union, Intersection, Difference, Instance)
+    )
+
+
+def _as_mat3(value, path):
+    """Validate a 3x3 numeric matrix; return a row-major 9-tuple of Fractions."""
+    if isinstance(value, (str, bytes)):
+        raise GeometryError(f"{path}: expected 3 rows of 3 numbers, got str/bytes")
+    try:
+        rows = tuple(value)
+    except TypeError:
+        raise GeometryError(
+            f"{path}: expected a 3x3 matrix, got {type(value).__name__}"
+        )
+    if len(rows) != 3:
+        raise GeometryError(f"{path}: expected 3 rows, got {len(rows)}")
+    matrix = []
+    for r, row in enumerate(rows):
+        if isinstance(row, (str, bytes)):
+            raise GeometryError(
+                f"{path}[{r}]: expected a row of 3 numbers, got str/bytes"
+            )
+        try:
+            items = tuple(row)
+        except TypeError:
+            raise GeometryError(
+                f"{path}[{r}]: expected a row of 3 numbers, "
+                f"got {type(row).__name__}"
+            )
+        if len(items) != 3:
+            raise GeometryError(
+                f"{path}[{r}]: expected 3 columns, got {len(items)}"
+            )
+        for c, item in enumerate(items):
+            matrix.append(_as_number(item, f"{path}[{r}][{c}]"))
+    return tuple(matrix)
 
 
 def _check_children(children, path):
@@ -205,6 +247,56 @@ class Difference:
         )
 
 
+class Instance:
+    """``Instance(child, linear, translation, instance_id)``: one reference
+    to an existing CSG subtree placed by the invertible affine map
+    ``p_world = A @ p_local + b``.
+
+    The transform belongs to this reference only: the shared child node is
+    never modified and may be referenced from multiple ``Instance`` nodes.
+    ``linear`` is a 3x3 matrix and ``translation`` a 3-vector, all entries
+    ``int``/``float`` (stored exactly as Fractions); the matrix must be
+    invertible (non-zero determinant) -- singular matrices, including
+    reflections composed to rank-deficient maps, are rejected.
+    """
+
+    __slots__ = ("child", "linear", "translation", "instance_id")
+
+    def __init__(self, child, linear, translation=(0, 0, 0),
+                 instance_id="instance"):
+        if not _is_node(child):
+            raise GeometryError(
+                f"Instance(instance_id={instance_id!r}).child: not a CSG node "
+                f"({type(child).__name__})"
+            )
+        path = f"Instance(instance_id={instance_id!r})"
+        if isinstance(instance_id, bool) or not isinstance(instance_id, str) \
+                or not instance_id:
+            raise GeometryError(f"{path}.instance_id: must be a non-empty str")
+        linear = _as_mat3(linear, f"{path}.linear")
+        translation = _as_vec3(translation, f"{path}.translation")
+        det = (
+            linear[0] * (linear[4] * linear[8] - linear[5] * linear[7])
+            - linear[1] * (linear[3] * linear[8] - linear[5] * linear[6])
+            + linear[2] * (linear[3] * linear[7] - linear[4] * linear[6])
+        )
+        if det == 0:
+            raise GeometryError(
+                f"{path}.linear: matrix must be invertible, got a singular "
+                f"matrix (det = 0)"
+            )
+        self.child = child
+        self.linear = linear
+        self.translation = translation
+        self.instance_id = instance_id
+
+    def __repr__(self):
+        return (
+            f"Instance({self.child!r}, {self.linear!r}, "
+            f"{self.translation!r}, {self.instance_id!r})"
+        )
+
+
 @dataclass(frozen=True)
 class Ray:
     """Ray ``origin + t * direction`` over the whole real line (t in R).
@@ -230,13 +322,21 @@ class Ray:
 
 @dataclass(frozen=True)
 class Source:
-    """One face of one leaf participating in a boundary or touch.
+    """One face of one leaf occurrence participating in a boundary or touch.
+
+    ``leaf_id`` identifies the original leaf definition.  ``path`` is the
+    tuple of ``instance_id`` values of the :class:`Instance` nodes traversed
+    from the scene root to that occurrence (empty for an un-instanced leaf):
+    two references to the same shared subtree are therefore distinct sources
+    ``(path, leaf_id)``.
 
     ``face`` is ``"sphere"`` for spheres and one of ``"x_lo"``, ``"x_hi"``,
     ``"y_lo"``, ``"y_hi"``, ``"z_lo"``, ``"z_hi"`` for boxes.  ``normal`` is
-    the outward unit normal of that face at the hit point, flipped when the
-    leaf acts as a subtractor inside :class:`Difference` (``flipped`` is then
-    True).  ``kind`` is the leaf-side event kind: ``"enter"``, ``"exit"`` or
+    the outward unit normal of that face at the hit point, in world
+    coordinates (pushed through the inverse-transpose of the occurrence
+    transform and renormalized), flipped when the occurrence acts as a
+    subtractor inside :class:`Difference` (``flipped`` is then True).
+    ``kind`` is the leaf-side event kind: ``"enter"``, ``"exit"`` or
     ``"touch"`` (tangential / face-riding contact).
     """
 
@@ -245,6 +345,7 @@ class Source:
     kind: str
     normal: tuple
     flipped: bool
+    path: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -252,9 +353,9 @@ class Boundary:
     """A solid boundary of the CSG result at parameter ``t``.
 
     ``kind`` is ``"enter"`` (empty -> solid) or ``"exit"`` (solid -> empty).
-    ``sources`` holds every contributing face sorted by ``(leaf_id, face)``;
-    ``source`` is the representative, the first source in leaf-id
-    lexicographic order.
+    ``sources`` holds every contributing face sorted by
+    ``(path, leaf_id, face)``; ``source`` is the representative, the first
+    source in that order.
     """
 
     t: float

@@ -1,25 +1,35 @@
-"""Core sweep algorithm: CSG ray-interval intersection with cavities.
+"""Core sweep algorithm: CSG ray-interval intersection with cavities and
+reusable, transformable subtree instances.
 
 Pipeline of :func:`ray_intervals`:
 
-1. Validate the tree (node budget, no shared nodes, unique leaf ids) and
-   record each leaf's polarity (flipped under an odd number of Difference
-   subtractor positions).
-2. Turn every leaf into events on the ray parameter t: ``enter``/``exit``
-   (solid crossings), ``touch`` (isolated tangential contact) and
-   ``tstart``/``tend`` (zero-thickness face-riding contact of a ray lying on
-   a box face).  All event parameters are exact (Fraction or quadratic Root).
+1. Validate the scene DAG (declared-node budget, instance-leaf-occurrence
+   budget, no reference cycles, unique leaf and instance ids, sharing only
+   through :class:`Instance` edges) and expand it into *occurrences*: every
+   walk from the root reaches one leaf occurrence carrying its Difference
+   polarity, its instance ``path`` and its composed world-from-local affine
+   map ``p_world = A @ p_local + b``.  The shared child nodes are never
+   copied or mutated; each reference just records another frame.
+2. For every occurrence, inverse-transform the world ray into the leaf's
+   local frame: ``o_local = A^-1 (o - b)``, ``d_local = A^-1 d``.  The
+   direction is deliberately NOT renormalized, so the ray parameter t is
+   preserved (also under reflections: enter/exit are never swapped).  Each
+   occurrence then yields the same exact events as a plain leaf:
+   enter/exit, touch, tstart/tend.
 3. Cluster coincident event parameters exactly, then sweep the t-line with a
-   three-valued state (IN / T / OUT) per leaf and per Boolean node.  Events
-   at the same t are applied as one batch, so coincident events that cause
-   no state change never create phantom boundaries.
+   three-valued state (IN / T / OUT) per leaf occurrence and per Boolean
+   node.  Events at the same t are applied as one batch, so coincident
+   events that cause no state change never create phantom boundaries.
 4. Regularize: maximal T-runs flanked by solid on both sides are swallowed
    (a tangent touch does not puncture a solid); T-runs flanked by empty on
    both sides become zero-measure touches; the rest become ordinary
    boundaries.  Isolated empty points between solid segments are swallowed.
-5. Emit sorted disjoint open intervals, touches, all boundaries (with full
-   source lists and a lexicographic representative) and the nearest boundary
-   with t > 0.
+5. Transform local face normals to world coordinates with the inverse
+   transpose A^-T and renormalize (exact Fractions stay exact; irrational
+   normals get one float rounding), apply the Difference polarity flip at
+   the occurrence's own level, and emit sorted disjoint open intervals,
+   touches, boundaries (sources qualified by instance path + original leaf
+   id) and the nearest boundary with t > 0.
 """
 
 from __future__ import annotations
@@ -30,11 +40,13 @@ from fractions import Fraction
 
 from ._exact import Root, cmp_tval, frac_to_decimal, sorted_unique, tval_to_float
 from ._types import (
+    MAX_LEAF_OCCURRENCES,
     MAX_TREE_NODES,
     Boundary,
     Box,
     Difference,
     GeometryError,
+    Instance,
     Intersection,
     Interval,
     Ray,
@@ -54,64 +66,200 @@ _SOLID = "SOLID"
 _EMPTY = "EMPTY"
 _TOUCH = "TOUCH"
 
-_BOX_NORMALS = {
-    "x_lo": (-1.0, 0.0, 0.0),
-    "x_hi": (1.0, 0.0, 0.0),
-    "y_lo": (0.0, -1.0, 0.0),
-    "y_hi": (0.0, 1.0, 0.0),
-    "z_lo": (0.0, 0.0, -1.0),
-    "z_hi": (0.0, 0.0, 1.0),
-}
+# Evaluator node tags (small ints make the hot sweep loop cheap).
+_E_LEAF = 0
+_E_UNION = 1
+_E_INTER = 2
+_E_DIFF = 3
+
+_FRAC0 = Fraction(0)
+_FRAC1 = Fraction(1)
+_IDENTITY = (
+    _FRAC1, _FRAC0, _FRAC0,
+    _FRAC0, _FRAC1, _FRAC0,
+    _FRAC0, _FRAC0, _FRAC1,
+)
 
 
 # ---------------------------------------------------------------------------
-# tree validation
+# exact 3x3 affine helpers (row-major tuples of Fractions)
 # ---------------------------------------------------------------------------
 
-def _validate_and_collect(tree):
-    """Check tree structure; return (leaves, polarities) in traversal order."""
-    leaves = []
-    polarities = []
-    seen_nodes = set()
-    leaf_paths = {}
-    count = 0
+def _mat_mul(A, B):
+    """C = A @ B for row-major 3x3 tuples."""
+    return tuple(
+        sum(A[3 * r + k] * B[3 * k + c] for k in range(3))
+        for r in range(3) for c in range(3)
+    )
 
-    def walk(node, polarity, path):
-        nonlocal count
-        count += 1
-        if count > MAX_TREE_NODES:
-            raise GeometryError(
-                f"{path}: CSG tree exceeds the limit of {MAX_TREE_NODES} nodes"
-            )
-        if id(node) in seen_nodes:
-            raise GeometryError(
-                f"{path}: node {node!r} is shared/reused; the CSG tree must be "
-                f"a proper tree (no node may appear twice)"
-            )
-        seen_nodes.add(id(node))
-        if isinstance(node, (Sphere, Box)):
-            if node.leaf_id in leaf_paths:
+
+def _mat_vec(A, v):
+    return tuple(
+        A[3 * r] * v[0] + A[3 * r + 1] * v[1] + A[3 * r + 2] * v[2]
+        for r in range(3)
+    )
+
+
+def _invert3(A):
+    """Exact inverse of a non-singular 3x3 Fraction matrix (adj/det)."""
+    a00, a01, a02, a10, a11, a12, a20, a21, a22 = A
+    c00 = a11 * a22 - a12 * a21
+    c01 = a12 * a20 - a10 * a22
+    c02 = a10 * a21 - a11 * a20
+    c10 = a02 * a21 - a01 * a22
+    c11 = a00 * a22 - a02 * a20
+    c12 = a01 * a20 - a00 * a21
+    c20 = a01 * a12 - a02 * a11
+    c21 = a02 * a10 - a00 * a12
+    c22 = a00 * a11 - a01 * a10
+    det = a00 * c00 + a01 * c01 + a02 * c02
+    if det == 0:
+        raise GeometryError(  # unreachable: Instance rejects singular maps
+            "Instance: composed transform is singular"
+        )
+    # adjugate = cofactor transpose
+    adj = (c00, c10, c20, c01, c11, c21, c02, c12, c22)
+    return tuple(value / det for value in adj)
+
+
+# ---------------------------------------------------------------------------
+# DAG validation + expansion into leaf occurrences
+# ---------------------------------------------------------------------------
+
+def _prepare(tree):
+    """Validate the scene DAG and expand it into leaf occurrences.
+
+    Returns ``(occurrences, evaluator)`` where each occurrence is a dict with
+    keys ``leaf``, ``polarity``, ``path``, ``A``, ``b``, ``Ainv`` and the
+    evaluator is a nested ``(tag, *args)`` structure whose leaf nodes index
+    the occurrence list.
+
+    Rules (see README.md):
+    * distinct declared nodes (leaves + internal + instances) <= 100;
+    * leaf occurrences after expansion <= MAX_LEAF_OCCURRENCES;
+    * non-Instance edges form a proper tree (sharing is allowed only through
+      an Instance reference);
+    * following Instance child edges must never revisit a node on the current
+      walk (no reference cycles);
+    * leaf_id / instance_id are unique among distinct declared nodes.
+    """
+    occurrences = []
+    declared = set()                 # ids of distinct declared nodes
+    leaf_id_owner = {}               # leaf_id -> node id of its first declaration
+    instance_id_owner = {}           # instance_id -> node id of its first declaration
+    active = set()                   # node ids on the current DFS walk
+
+    def expand(node, polarity, path, A, b, static_path, skeleton):
+        """Walk the DAG.  ``skeleton`` is the set of node ids reached by
+        non-Instance edges in the current skeleton expansion: the scene
+        root starts one, and every Instance child starts a fresh one, so the
+        same shared subtree may be walked many times while plain sharing
+        (two static edges into one node) stays forbidden.
+        """
+        nid = id(node)
+        first_sight = nid not in declared
+        if first_sight:
+            if len(declared) >= MAX_TREE_NODES:
                 raise GeometryError(
-                    f"{path}: duplicate leaf_id {node.leaf_id!r} "
-                    f"(first used at {leaf_paths[node.leaf_id]})"
+                    f"{static_path}: CSG scene exceeds the limit of "
+                    f"{MAX_TREE_NODES} distinct declared nodes"
                 )
-            leaf_paths[node.leaf_id] = path
-            leaves.append(node)
-            polarities.append(polarity)
-        elif isinstance(node, (Union, Intersection)):
-            for i, child in enumerate(node.children):
-                walk(child, polarity, f"{path}.children[{i}]")
-        elif isinstance(node, Difference):
-            walk(node.positive, polarity, f"{path}.positive")
-            for i, sub in enumerate(node.subtractors):
-                walk(sub, -polarity, f"{path}.subtractors[{i}]")
-        else:
+            declared.add(nid)
+        if nid in skeleton:
             raise GeometryError(
-                f"{path}: not a CSG node ({type(node).__name__})"
+                f"{static_path}: node {node!r} is shared/reused outside of "
+                f"an Instance (a node may be referenced twice only through "
+                f"an Instance node)"
             )
+        skeleton.add(nid)
 
-    walk(tree, 1, "tree")
-    return leaves, polarities
+        if nid in active:
+            raise GeometryError(
+                f"{static_path}: reference cycle detected; an Instance may "
+                f"not (transitively) reference its own subtree"
+            )
+        active.add(nid)
+        try:
+            if isinstance(node, (Sphere, Box)):
+                if first_sight:
+                    owner = leaf_id_owner.get(node.leaf_id)
+                    if owner is not None and owner != nid:
+                        raise GeometryError(
+                            f"{static_path}: duplicate leaf_id "
+                            f"{node.leaf_id!r} (first used by another node)"
+                        )
+                    leaf_id_owner[node.leaf_id] = nid
+                if len(occurrences) >= MAX_LEAF_OCCURRENCES:
+                    raise GeometryError(
+                        f"{static_path}: instance expansion exceeds the limit "
+                        f"of {MAX_LEAF_OCCURRENCES} leaf occurrences"
+                    )
+                index = len(occurrences)
+                occurrences.append(
+                    {
+                        "leaf": node,
+                        "polarity": polarity,
+                        "path": path,
+                        "A": A,
+                        "b": b,
+                        "Ainv": _IDENTITY if A is _IDENTITY else _invert3(A),
+                    }
+                )
+                return (_E_LEAF, index)
+
+            if isinstance(node, (Union, Intersection)):
+                children = [
+                    expand(
+                        child, polarity, path, A, b,
+                        f"{static_path}.children[{i}]", skeleton,
+                    )
+                    for i, child in enumerate(node.children)
+                ]
+                tag = _E_UNION if isinstance(node, Union) else _E_INTER
+                return (tag, tuple(children))
+
+            if isinstance(node, Difference):
+                positive = expand(
+                    node.positive, polarity, path, A, b,
+                    f"{static_path}.positive", skeleton,
+                )
+                subtractors = tuple(
+                    expand(
+                        sub, -polarity, path, A, b,
+                        f"{static_path}.subtractors[{i}]", skeleton,
+                    )
+                    for i, sub in enumerate(node.subtractors)
+                )
+                return (_E_DIFF, positive, subtractors)
+
+            if isinstance(node, Instance):
+                if first_sight:
+                    owner = instance_id_owner.get(node.instance_id)
+                    if owner is not None and owner != nid:
+                        raise GeometryError(
+                            f"{static_path}.instance_id: duplicate instance_id "
+                            f"{node.instance_id!r} (first used by another node)"
+                        )
+                    instance_id_owner[node.instance_id] = nid
+                # Compose frames: p_world = A (L p_child + t) + b
+                #                       = (A L) p_child + (A t + b)
+                A2 = _mat_mul(A, node.linear)
+                At = _mat_vec(A, node.translation)
+                b2 = tuple(At[i] + b[i] for i in range(3))
+                return expand(
+                    node.child, polarity, path + (node.instance_id,), A2, b2,
+                    f"{static_path}.child[Instance {node.instance_id!r}]",
+                    set(),
+                )
+
+            raise GeometryError(
+                f"{static_path}: not a CSG node ({type(node).__name__})"
+            )
+        finally:
+            active.discard(nid)
+
+    root_eval = expand(tree, 1, (), _IDENTITY, (_FRAC0,) * 3, "tree", set())
+    return occurrences, root_eval
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +377,7 @@ def _box_events(box, origin, direction):
 
 
 # ---------------------------------------------------------------------------
-# three-valued Boolean evaluation
+# three-valued Boolean evaluation over the expanded occurrence tree
 # ---------------------------------------------------------------------------
 
 def _sub_state(positive, negative):
@@ -241,50 +389,54 @@ def _sub_state(positive, negative):
     return _OUT if positive == _OUT else _T
 
 
-def _make_evaluator(tree, leaf_index):
+def _make_evaluator(root_eval):
     def evaluate(node, leaf_state):
-        if isinstance(node, (Sphere, Box)):
-            return leaf_state(leaf_index[id(node)])
-        if isinstance(node, Union):
+        tag = node[0]
+        if tag == _E_LEAF:
+            return leaf_state(node[1])
+        if tag == _E_UNION:
             saw_touch = False
-            for child in node.children:
+            for child in node[1]:
                 state = evaluate(child, leaf_state)
                 if state == _IN:
                     return _IN
                 if state == _T:
                     saw_touch = True
             return _T if saw_touch else _OUT
-        if isinstance(node, Intersection):
+        if tag == _E_INTER:
             saw_touch = False
-            for child in node.children:
+            for child in node[1]:
                 state = evaluate(child, leaf_state)
                 if state == _OUT:
                     return _OUT
                 if state == _T:
                     saw_touch = True
             return _T if saw_touch else _IN
-        if isinstance(node, Difference):
-            result = evaluate(node.positive, leaf_state)
-            for sub in node.subtractors:
-                result = _sub_state(result, evaluate(sub, leaf_state))
-            return result
-        raise GeometryError(f"tree: not a CSG node ({type(node).__name__})")
+        # difference: (tag, positive, subtractors)
+        result = evaluate(node[1], leaf_state)
+        for sub in node[2]:
+            result = _sub_state(result, evaluate(sub, leaf_state))
+        return result
 
     return evaluate
 
 
 # ---------------------------------------------------------------------------
-# normals
+# normals (local frame -> world frame)
 # ---------------------------------------------------------------------------
 
-def _sphere_normal(sphere, origin, direction, tval):
-    """Outward unit normal at the hit point (exact when tval is rational)."""
+def _local_sphere_normal(sphere, origin, direction, tval):
+    """Outward unit normal of a sphere in *local* coordinates.
+
+    Returns exact Fraction components when ``tval`` is rational (the hit
+    point divided by the radius is already a unit vector); for an
+    irrational quadratic root it returns Decimal components at 70 digits.
+    """
     if isinstance(tval, Fraction):
-        normal = [
+        return [
             (origin[i] + tval * direction[i] - sphere.center[i]) / sphere.radius
             for i in range(3)
-        ]
-        return tuple(float(component) for component in normal)
+        ], True
     with localcontext() as ctx:
         ctx.prec = 70
         t_dec = tval.decimal(70)
@@ -297,7 +449,61 @@ def _sphere_normal(sphere, origin, direction, tval):
             / frac_to_decimal(sphere.radius)
             for i in range(3)
         ]
-        return tuple(float(component) for component in normal)
+        return normal, False
+
+
+def _normalize_exact(components):
+    """Normalize a Fraction 3-vector exactly when its length^2 is a square."""
+    length2 = sum(c * c for c in components)
+    num_root = math.isqrt(length2.numerator)
+    den_root = math.isqrt(length2.denominator)
+    if num_root * num_root == length2.numerator and \
+            den_root * den_root == length2.denominator:
+        length = Fraction(num_root, den_root)
+        return tuple(float(c / length) for c in components), True
+    return None, False
+
+
+def _normalize_decimal(components):
+    with localcontext() as ctx:
+        ctx.prec = 70
+        length = sum(c * c for c in components).sqrt()
+        return tuple(float(c / length) for c in components)
+
+
+def _world_normal(local_normal, exact_local, Ainv):
+    """Push a local outward normal to world space: n_w = normalize(A^-T n_l).
+
+    The inverse transpose is required so that the transformed normal stays
+    perpendicular to the transformed tangent plane (shears and anisotropic
+    scaling would break a plain ``A n`` / matrix-vector transform).  For a
+    reflection (det A < 0) this yields the outward normal of the mirrored
+    solid directly -- no enter/exit swapping is involved.
+    """
+    if Ainv is None:
+        # untransformed occurrence: local == world
+        if exact_local:
+            return tuple(float(c) + 0.0 for c in local_normal)
+        return _normalize_decimal(local_normal)
+    if exact_local:
+        # Ainv row-major: (A^-T n)_r = sum_c Ainv[c*3+r] n_c (columns of Ainv)
+        transformed = [
+            sum(Ainv[c * 3 + r] * local_normal[c] for c in range(3))
+            for r in range(3)
+        ]
+        normalized, ok = _normalize_exact(transformed)
+        if ok:
+            return tuple(c + 0.0 for c in normalized)
+        dec = [frac_to_decimal(c) for c in transformed]
+        return tuple(c + 0.0 for c in _normalize_decimal(dec))
+    with localcontext() as ctx:
+        ctx.prec = 70
+        dAinv = [frac_to_decimal(v) for v in Ainv]
+        transformed = [
+            sum(dAinv[c * 3 + r] * local_normal[c] for c in range(3))
+            for r in range(3)
+        ]
+    return tuple(c + 0.0 for c in _normalize_decimal(transformed))
 
 
 # ---------------------------------------------------------------------------
@@ -305,11 +511,12 @@ def _sphere_normal(sphere, origin, direction, tval):
 # ---------------------------------------------------------------------------
 
 def ray_intervals(tree, ray):
-    """Intersect a ray with a CSG tree; return a RayIntervalsResult.
+    """Intersect a ray with a CSG scene (possibly instanced); return a result.
 
     See module docstring and README.md for the full contract.  Raises
-    GeometryError for invalid input and CertificationBudgetExhausted when
-    event ordering exceeds the precision budget.
+    GeometryError for invalid input (including reference cycles and singular
+    instance matrices) and CertificationBudgetExhausted when event ordering
+    exceeds the precision budget.
     """
     if not isinstance(ray, Ray):
         raise GeometryError(f"ray: expected a Ray, got {type(ray).__name__}")
@@ -318,20 +525,36 @@ def ray_intervals(tree, ray):
     origin = ray.origin
     direction = ray.direction
 
-    leaves, polarities = _validate_and_collect(tree)
-    leaf_index = {id(leaf): i for i, leaf in enumerate(leaves)}
-    evaluate = _make_evaluator(tree, leaf_index)
+    occurrences, root_eval = _prepare(tree)
+    evaluate = _make_evaluator(root_eval)
 
-    # -- per-leaf events -------------------------------------------------
-    leaf_events = []
-    for leaf in leaves:
-        if isinstance(leaf, Sphere):
-            leaf_events.append(_sphere_events(leaf, origin, direction))
+    # -- per-occurrence local ray and events --------------------------------
+    # The world ray is inverse-transformed into each leaf frame.  The local
+    # direction is A^-1 d WITHOUT renormalization: p(o + t d) = p_l + t d_l,
+    # so the hit parameter stays the same world t (preserving t-intervals,
+    # and keeping enter/exit correct under negative determinants).
+    occurrence_events = []
+    for occ in occurrences:
+        Ainv = occ["Ainv"]
+        if Ainv is _IDENTITY:
+            o_local = origin
+            d_local = direction
         else:
-            leaf_events.append(_box_events(leaf, origin, direction))
+            shifted = tuple(origin[i] - occ["b"][i] for i in range(3))
+            o_local = _mat_vec(Ainv, shifted)
+            d_local = _mat_vec(Ainv, direction)
+        leaf = occ["leaf"]
+        if isinstance(leaf, Sphere):
+            events = _sphere_events(leaf, o_local, d_local)
+        else:
+            events = _box_events(leaf, o_local, d_local)
+        occurrence_events.append(events)
 
-    # -- exact clustering of coincident event parameters -----------------
-    all_tvals = [tval for events in leaf_events for (tval, _kind, _faces) in events]
+    # -- exact clustering of coincident event parameters -------------------
+    all_tvals = [
+        tval for events in occurrence_events
+        for (tval, _kind, _faces) in events
+    ]
     clusters = sorted_unique(all_tvals)
     n_clusters = len(clusters)
 
@@ -348,21 +571,22 @@ def ray_intervals(tree, ray):
                 hi = mid
         raise AssertionError("event parameter missing from its own clusters")
 
-    leaf_events_at = [dict() for _ in leaves]
-    for li, events in enumerate(leaf_events):
+    n_occ = len(occurrences)
+    events_at = [dict() for _ in occurrences]
+    for li, events in enumerate(occurrence_events):
         for tval, kind, faces in events:
-            leaf_events_at[li].setdefault(cluster_index(tval), []).append((kind, faces))
+            events_at[li].setdefault(cluster_index(tval), []).append((kind, faces))
 
-    # -- per-leaf segment / point states ----------------------------------
+    # -- per-occurrence segment / point states ------------------------------
     # Segment j is the open interval between cluster j-1 and cluster j
     # (segment 0 lies before the first cluster, segment n after the last).
-    leaf_seg = [[_OUT] * (n_clusters + 1) for _ in leaves]
-    leaf_pt = [[_OUT] * n_clusters for _ in leaves]
-    for li in range(len(leaves)):
+    leaf_seg = [[_OUT] * (n_clusters + 1) for _ in occurrences]
+    leaf_pt = [[_OUT] * n_clusters for _ in occurrences]
+    for li in range(n_occ):
         depth = 0
         riding = 0
         for ci in range(n_clusters):
-            events = leaf_events_at[li].get(ci, [])
+            events = events_at[li].get(ci, [])
             kinds = {kind for kind, _faces in events}
             if "enter" in kinds or "exit" in kinds:
                 leaf_pt[li][ci] = _OUT  # crossing boundary point
@@ -379,7 +603,9 @@ def ray_intervals(tree, ray):
                     riding += 1
                 elif kind == "tend":
                     riding -= 1
-            leaf_seg[li][ci + 1] = _IN if depth > 0 else (_T if riding > 0 else _OUT)
+            leaf_seg[li][ci + 1] = _IN if depth > 0 else (
+                _T if riding > 0 else _OUT
+            )
 
     def seg_state(j, forced=None):
         def leaf_state(li):
@@ -387,7 +613,7 @@ def ray_intervals(tree, ray):
                 return forced[1]
             return leaf_seg[li][j]
 
-        return evaluate(tree, leaf_state)
+        return evaluate(root_eval, leaf_state)
 
     def pt_state(i, forced=None):
         def leaf_state(li):
@@ -395,7 +621,7 @@ def ray_intervals(tree, ray):
                 return forced[1]
             return leaf_pt[li][i]
 
-        return evaluate(tree, leaf_state)
+        return evaluate(root_eval, leaf_state)
 
     result_seg = [seg_state(j) for j in range(n_clusters + 1)]
     result_pt = [pt_state(i) for i in range(n_clusters)]
@@ -457,10 +683,10 @@ def ray_intervals(tree, ray):
 
     # -- source collection --------------------------------------------------
     def sources_at(ci):
-        """All leaf faces at cluster ci whose state matters to the result."""
+        """All occurrence faces at cluster ci whose state matters."""
         found = []
-        for li, leaf in enumerate(leaves):
-            events = leaf_events_at[li].get(ci)
+        for li, occ in enumerate(occurrences):
+            events = events_at[li].get(ci)
             if not events:
                 continue
             pair_in = (seg_state(ci, (li, _IN)), seg_state(ci + 1, (li, _IN)))
@@ -472,11 +698,11 @@ def ray_intervals(tree, ray):
                 for face in faces:
                     found.append(
                         _make_source(
-                            leaf, face, source_kind, clusters[ci],
-                            origin, direction, polarities[li],
+                            occ, face, source_kind, clusters[ci],
+                            origin, direction,
                         )
                     )
-        found.sort(key=lambda s: (s.leaf_id, s.face))
+        found.sort(key=lambda s: (s.path, s.leaf_id, s.face))
         return found
 
     # -- boundaries ---------------------------------------------------------
@@ -527,17 +753,17 @@ def ray_intervals(tree, ray):
         )
         j = j2 + 1
 
-    # -- touches --------------------------------------------------------------
+    # -- touches ------------------------------------------------------------
     touches = []
     for left_cluster, right_cluster in touch_runs:
         merged = []
         for ci in range(left_cluster, right_cluster + 1):
             merged.extend(sources_at(ci))
-        merged.sort(key=lambda s: (s.leaf_id, s.face, s.kind))
+        merged.sort(key=lambda s: (s.path, s.leaf_id, s.face, s.kind))
         unique = []
         seen = set()
         for source in merged:
-            key = (source.leaf_id, source.face, source.kind)
+            key = (source.path, source.leaf_id, source.face, source.kind)
             if key not in seen:
                 seen.add(key)
                 unique.append(source)
@@ -567,12 +793,30 @@ def ray_intervals(tree, ray):
     )
 
 
-def _make_source(leaf, face, kind, tval, origin, direction, polarity):
-    if isinstance(leaf, Sphere):
-        normal = _sphere_normal(leaf, origin, direction, tval)
+def _make_source(occ, face, kind, tval, origin, direction):
+    """Build a world-space Source for one occurrence face event."""
+    leaf = occ["leaf"]
+    Ainv = occ["Ainv"]
+    if Ainv is _IDENTITY:
+        o_local = origin
+        d_local = direction
     else:
-        normal = _BOX_NORMALS[face]
-    flipped = polarity < 0
+        o_local = _mat_vec(Ainv, tuple(origin[i] - occ["b"][i] for i in range(3)))
+        d_local = _mat_vec(Ainv, direction)
+    if isinstance(leaf, Sphere):
+        local_normal, exact_local = _local_sphere_normal(
+            leaf, o_local, d_local, tval
+        )
+        normal = _world_normal(local_normal, exact_local, Ainv)
+    else:
+        # Box face normals are signed axis vectors in the leaf frame; push
+        # the (unsigned) axis through A^-T and reapply the face sign.
+        col = "xyz".index(face[0])
+        sign = 1.0 if face.endswith("hi") else -1.0
+        local = [Fraction(1) if c == col else Fraction(0) for c in range(3)]
+        world = _world_normal(local, True, Ainv)
+        normal = tuple(sign * c for c in world)
+    flipped = occ["polarity"] < 0
     if flipped:
         normal = tuple(-component for component in normal)
     return Source(
@@ -582,4 +826,5 @@ def _make_source(leaf, face, kind, tval, origin, direction, polarity):
         # "+ 0.0" normalizes -0.0 produced by flipping zero components
         normal=tuple(float(component) + 0.0 for component in normal),
         flipped=flipped,
+        path=occ["path"],
     )
