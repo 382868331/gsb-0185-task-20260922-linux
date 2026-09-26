@@ -80,7 +80,9 @@ def _as_leaf_id(value, path):
 
 
 def _is_node(value):
-    return isinstance(value, (Sphere, Box, Union, Intersection, Difference))
+    return isinstance(
+        value, (Sphere, Box, Cylinder, Union, Intersection, Difference)
+    )
 
 
 def _check_children(children, path):
@@ -143,6 +145,51 @@ class Box:
                 )
         object.__setattr__(self, "mins", mins)
         object.__setattr__(self, "maxs", maxs)
+
+
+@dataclass(frozen=True)
+class Cylinder:
+    """Finite closed cylinder aligned with the local z-axis.
+
+    The cylinder extends from ``center.z - lower_height`` to
+    ``center.z + upper_height``.  Both heights are positive and differ.
+    """
+
+    center: object
+    radius: object
+    lower_height: object
+    upper_height: object
+    leaf_id: str
+
+    def __post_init__(self):
+        path = f"Cylinder(leaf_id={self.leaf_id!r})"
+        object.__setattr__(self, "leaf_id", _as_leaf_id(self.leaf_id, path))
+        object.__setattr__(self, "center", _as_vec3(self.center, f"{path}.center"))
+        radius = _as_number(self.radius, f"{path}.radius")
+        lower_height = _as_number(
+            self.lower_height, f"{path}.lower_height"
+        )
+        upper_height = _as_number(
+            self.upper_height, f"{path}.upper_height"
+        )
+        if radius <= 0:
+            raise GeometryError(f"{path}.radius: must be > 0, got {self.radius!r}")
+        if lower_height <= 0:
+            raise GeometryError(
+                f"{path}.lower_height: must be > 0, got {self.lower_height!r}"
+            )
+        if upper_height <= 0:
+            raise GeometryError(
+                f"{path}.upper_height: must be > 0, got {self.upper_height!r}"
+            )
+        if lower_height == upper_height:
+            raise GeometryError(
+                f"{path}: lower_height and upper_height must differ, "
+                f"got {self.lower_height!r} and {self.upper_height!r}"
+            )
+        object.__setattr__(self, "radius", radius)
+        object.__setattr__(self, "lower_height", lower_height)
+        object.__setattr__(self, "upper_height", upper_height)
 
 
 @dataclass(frozen=True)
@@ -232,12 +279,12 @@ class Ray:
 class Source:
     """One face of one leaf participating in a boundary or touch.
 
-    ``face`` is ``"sphere"`` for spheres and one of ``"x_lo"``, ``"x_hi"``,
-    ``"y_lo"``, ``"y_hi"``, ``"z_lo"``, ``"z_hi"`` for boxes.  ``normal`` is
-    the outward unit normal of that face at the hit point, flipped when the
-    leaf acts as a subtractor inside :class:`Difference` (``flipped`` is then
-    True).  ``kind`` is the leaf-side event kind: ``"enter"``, ``"exit"`` or
-    ``"touch"`` (tangential / face-riding contact).
+    ``face`` is ``"sphere"`` for spheres, ``"side"``/``"z_lo"``/``"z_hi"``
+    for cylinders, and one of the six box-plane names for boxes.  ``normal``
+    is the outward unit normal of that face at the hit point, flipped when
+    the leaf acts as a subtractor inside :class:`Difference` (``flipped`` is
+    then True).  ``kind`` is the leaf-side event kind: ``"enter"``,
+    ``"exit"`` or ``"touch"`` (tangential / face-riding contact).
     """
 
     leaf_id: str

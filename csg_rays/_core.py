@@ -33,6 +33,7 @@ from ._types import (
     MAX_TREE_NODES,
     Boundary,
     Box,
+    Cylinder,
     Difference,
     GeometryError,
     Intersection,
@@ -89,7 +90,7 @@ def _validate_and_collect(tree):
                 f"a proper tree (no node may appear twice)"
             )
         seen_nodes.add(id(node))
-        if isinstance(node, (Sphere, Box)):
+        if isinstance(node, (Sphere, Box, Cylinder)):
             if node.leaf_id in leaf_paths:
                 raise GeometryError(
                     f"{path}: duplicate leaf_id {node.leaf_id!r} "
@@ -228,6 +229,140 @@ def _box_events(box, origin, direction):
     return [(enter_t, "enter", tuple(enter_faces)), (exit_t, "exit", tuple(exit_faces))]
 
 
+def _radial_profile(origin, direction, center, radius):
+    dx = direction[0]
+    dy = direction[1]
+    ox = origin[0] - center[0]
+    oy = origin[1] - center[1]
+    a = dx * dx + dy * dy
+    c = ox * ox + oy * oy - radius * radius
+    if a == 0:
+        if c < 0:
+            return ("inside", None, None)
+        if c == 0:
+            return ("riding", None, None)
+        return ("outside", None, None)
+    b = 2 * (ox * dx + oy * dy)
+    disc = b * b - 4 * a * c
+    if disc < 0:
+        return ("outside", None, None)
+    if disc == 0:
+        tangent = -b / (2 * a)
+        return ("tangent", tangent, tangent)
+    sqrt_disc = _sqrt_fraction(disc)
+    if sqrt_disc is not None:
+        t_lo = (-b - sqrt_disc) / (2 * a)
+        t_hi = (-b + sqrt_disc) / (2 * a)
+    else:
+        t_lo = Root(a, b, c, -1)
+        t_hi = Root(a, b, c, +1)
+    return ("interval", t_lo, t_hi)
+
+
+def _axial_profile(origin, direction, cylinder):
+    dz = direction[2]
+    oz = origin[2] - cylinder.center[2]
+    z_lo = -cylinder.lower_height
+    z_hi = cylinder.upper_height
+    if dz == 0:
+        if oz < z_lo or oz > z_hi:
+            return ("outside", None, None, None, None)
+        if oz == z_lo:
+            return ("riding", None, None, "z_lo", "z_lo")
+        if oz == z_hi:
+            return ("riding", None, None, "z_hi", "z_hi")
+        return ("inside", None, None, None, None)
+    t_lo = (z_lo - oz) / dz
+    t_hi = (z_hi - oz) / dz
+    if dz > 0:
+        return ("interval", t_lo, t_hi, "z_lo", "z_hi")
+    return ("interval", t_hi, t_lo, "z_hi", "z_lo")
+
+
+def _tval_max(x, y):
+    return x if cmp_tval(x, y) >= 0 else y
+
+
+def _tval_min(x, y):
+    return x if cmp_tval(x, y) <= 0 else y
+
+
+def _cylinder_events(cylinder, origin, direction):
+    radial_kind, radial_lo, radial_hi = _radial_profile(
+        origin, direction, cylinder.center, cylinder.radius
+    )
+    axial_kind, axial_lo, axial_hi, axial_lo_face, axial_hi_face = _axial_profile(
+        origin, direction, cylinder
+    )
+    if radial_kind == "outside" or axial_kind == "outside":
+        return []
+    zero = Fraction(0)
+
+    if radial_kind == "inside":
+        if axial_kind == "inside":
+            return []
+        if axial_kind == "interval":
+            return [
+                (axial_lo, "enter", (axial_lo_face,)),
+                (axial_hi, "exit", (axial_hi_face,)),
+            ]
+        return [(zero, "touch", (axial_lo_face,))]
+
+    if radial_kind == "riding":
+        if axial_kind == "inside":
+            return [(zero, "touch", ("side",))]
+        if axial_kind == "interval":
+            return [
+                (axial_lo, "tstart", ("side", axial_lo_face)),
+                (axial_hi, "tend", ("side", axial_hi_face)),
+            ]
+        return [(zero, "touch", ("side", axial_lo_face))]
+
+    if radial_kind == "tangent":
+        tangent = radial_lo
+        if axial_kind == "inside":
+            return [(tangent, "touch", ("side",))]
+        if axial_kind == "riding":
+            return [(tangent, "touch", ("side", axial_lo_face))]
+        if axial_kind == "interval":
+            if cmp_tval(tangent, axial_lo) < 0 or cmp_tval(tangent, axial_hi) > 0:
+                return []
+            faces = ["side"]
+            if cmp_tval(tangent, axial_lo) == 0:
+                faces.append(axial_lo_face)
+            if cmp_tval(tangent, axial_hi) == 0:
+                faces.append(axial_hi_face)
+            return [(tangent, "touch", tuple(faces))]
+        return []
+
+    if axial_kind == "inside":
+        return [(radial_lo, "enter", ("side",)), (radial_hi, "exit", ("side",))]
+    if axial_kind == "riding":
+        return [
+            (radial_lo, "tstart", ("side", axial_lo_face)),
+            (radial_hi, "tend", ("side", axial_hi_face)),
+        ]
+
+    start = _tval_max(radial_lo, axial_lo)
+    end = _tval_min(radial_hi, axial_hi)
+    order = cmp_tval(start, end)
+    if order > 0:
+        return []
+    start_faces = []
+    if cmp_tval(start, radial_lo) == 0:
+        start_faces.append("side")
+    if cmp_tval(start, axial_lo) == 0:
+        start_faces.append(axial_lo_face)
+    end_faces = []
+    if cmp_tval(end, radial_hi) == 0:
+        end_faces.append("side")
+    if cmp_tval(end, axial_hi) == 0:
+        end_faces.append(axial_hi_face)
+    if order == 0:
+        return [(start, "touch", tuple(start_faces + end_faces))]
+    return [(start, "enter", tuple(start_faces)), (end, "exit", tuple(end_faces))]
+
+
 # ---------------------------------------------------------------------------
 # three-valued Boolean evaluation
 # ---------------------------------------------------------------------------
@@ -243,7 +378,7 @@ def _sub_state(positive, negative):
 
 def _make_evaluator(tree, leaf_index):
     def evaluate(node, leaf_state):
-        if isinstance(node, (Sphere, Box)):
+        if isinstance(node, (Sphere, Box, Cylinder)):
             return leaf_state(leaf_index[id(node)])
         if isinstance(node, Union):
             saw_touch = False
@@ -300,6 +435,34 @@ def _sphere_normal(sphere, origin, direction, tval):
         return tuple(float(component) for component in normal)
 
 
+def _cylinder_normal(cylinder, face, origin, direction, tval):
+    if face == "z_lo":
+        return (0.0, 0.0, -1.0)
+    if face == "z_hi":
+        return (0.0, 0.0, 1.0)
+    if isinstance(tval, Fraction):
+        normal = [
+            (origin[0] + tval * direction[0] - cylinder.center[0]) / cylinder.radius,
+            (origin[1] + tval * direction[1] - cylinder.center[1]) / cylinder.radius,
+            Fraction(0),
+        ]
+        return tuple(float(component) for component in normal)
+    with localcontext() as ctx:
+        ctx.prec = 70
+        t_dec = tval.decimal(70)
+        nx = (
+            frac_to_decimal(origin[0])
+            + t_dec * frac_to_decimal(direction[0])
+            - frac_to_decimal(cylinder.center[0])
+        ) / frac_to_decimal(cylinder.radius)
+        ny = (
+            frac_to_decimal(origin[1])
+            + t_dec * frac_to_decimal(direction[1])
+            - frac_to_decimal(cylinder.center[1])
+        ) / frac_to_decimal(cylinder.radius)
+        return (float(nx), float(ny), 0.0)
+
+
 # ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
@@ -327,6 +490,8 @@ def ray_intervals(tree, ray):
     for leaf in leaves:
         if isinstance(leaf, Sphere):
             leaf_events.append(_sphere_events(leaf, origin, direction))
+        elif isinstance(leaf, Cylinder):
+            leaf_events.append(_cylinder_events(leaf, origin, direction))
         else:
             leaf_events.append(_box_events(leaf, origin, direction))
 
@@ -570,6 +735,8 @@ def ray_intervals(tree, ray):
 def _make_source(leaf, face, kind, tval, origin, direction, polarity):
     if isinstance(leaf, Sphere):
         normal = _sphere_normal(leaf, origin, direction, tval)
+    elif isinstance(leaf, Cylinder):
+        normal = _cylinder_normal(leaf, face, origin, direction, tval)
     else:
         normal = _BOX_NORMALS[face]
     flipped = polarity < 0

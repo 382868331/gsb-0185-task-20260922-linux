@@ -16,6 +16,7 @@ from fractions import Fraction
 
 from csg_rays import (
     Box,
+    Cylinder,
     Difference,
     Intersection,
     Ray,
@@ -41,6 +42,21 @@ def _in_box(node, p, closed):
     return all(node.mins[i] < p[i] < node.maxs[i] for i in range(3))
 
 
+def _in_cylinder(node, p, closed):
+    radial = (
+        (p[0] - node.center[0]) ** 2
+        + (p[1] - node.center[1]) ** 2
+    )
+    z_min = node.center[2] - node.lower_height
+    z_max = node.center[2] + node.upper_height
+    radial_ok = radial <= node.radius**2 if closed else radial < node.radius**2
+    if closed:
+        z_ok = z_min <= p[2] <= z_max
+    else:
+        z_ok = z_min < p[2] < z_max
+    return radial_ok and z_ok
+
+
 def ref_inside(node, p, closed=False):
     """True iff point p (Fraction triple) lies in the solid.
 
@@ -51,6 +67,8 @@ def ref_inside(node, p, closed=False):
         return _in_sphere(node, p, closed)
     if isinstance(node, Box):
         return _in_box(node, p, closed)
+    if isinstance(node, Cylinder):
+        return _in_cylinder(node, p, closed)
     if isinstance(node, Union):
         return any(ref_inside(c, p, closed) for c in node.children)
     if isinstance(node, Intersection):
@@ -88,12 +106,27 @@ def _interior_point(origin, direction, t_float):
 def _random_tree(rng, depth, id_counter):
     if depth == 0 or rng.random() < 0.45:
         leaf_id = f"L{next(id_counter)}"
-        if rng.random() < 0.5:
+        leaf_kind = rng.randrange(3)
+        if leaf_kind == 0:
             center = tuple(rng.randint(-3, 3) for _ in range(3))
             return Sphere(center, rng.randint(1, 3), leaf_id)
-        mins = tuple(rng.randint(-3, 2) for _ in range(3))
-        maxs = tuple(m + rng.randint(1, 3) for m in mins)
-        return Box(mins, maxs, leaf_id)
+        if leaf_kind == 1:
+            mins = tuple(rng.randint(-3, 2) for _ in range(3))
+            maxs = tuple(m + rng.randint(1, 3) for m in mins)
+            return Box(mins, maxs, leaf_id)
+        center = tuple(rng.randint(-3, 3) for _ in range(3))
+        lower_height = rng.randint(1, 3)
+        while True:
+            upper_height = rng.randint(1, 3)
+            if upper_height != lower_height:
+                break
+        return Cylinder(
+            center,
+            rng.randint(1, 3),
+            lower_height,
+            upper_height,
+            leaf_id,
+        )
     op = rng.choice("uid")
     count = rng.randint(2, 3)
     subs = [_random_tree(rng, depth - 1, id_counter) for _ in range(count)]
