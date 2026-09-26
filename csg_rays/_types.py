@@ -80,7 +80,7 @@ def _as_leaf_id(value, path):
 
 
 def _is_node(value):
-    return isinstance(value, (Sphere, Box, Union, Intersection, Difference))
+    return isinstance(value, (Sphere, Box, Cylinder, Union, Intersection, Difference))
 
 
 def _check_children(children, path):
@@ -143,6 +143,42 @@ class Box:
                 )
         object.__setattr__(self, "mins", mins)
         object.__setattr__(self, "maxs", maxs)
+
+
+@dataclass(frozen=True)
+class Cylinder:
+    """Finite closed solid cylinder leaf, axis along the local z axis.
+
+    The cylinder is the set of points with
+    ``(x - cx)**2 + (y - cy)**2 <= radius**2`` and
+    ``z_lo <= z <= z_hi`` around ``center = (cx, cy, cz)``; the two caps may
+    sit at different heights around the center.  ``radius > 0`` and
+    ``z_lo < z_hi`` are required.  All numeric fields are stored as exact
+    Fractions.
+    """
+
+    center: object
+    radius: object
+    z_lo: object
+    z_hi: object
+    leaf_id: str
+
+    def __post_init__(self):
+        path = f"Cylinder(leaf_id={self.leaf_id!r})"
+        object.__setattr__(self, "leaf_id", _as_leaf_id(self.leaf_id, path))
+        object.__setattr__(self, "center", _as_vec3(self.center, f"{path}.center"))
+        radius = _as_number(self.radius, f"{path}.radius")
+        if radius <= 0:
+            raise GeometryError(f"{path}.radius: must be > 0, got {self.radius!r}")
+        object.__setattr__(self, "radius", radius)
+        z_lo = _as_number(self.z_lo, f"{path}.z_lo")
+        z_hi = _as_number(self.z_hi, f"{path}.z_hi")
+        if not z_lo < z_hi:
+            raise GeometryError(
+                f"{path}: z_hi must be > z_lo, got {self.z_lo!r} .. {self.z_hi!r}"
+            )
+        object.__setattr__(self, "z_lo", z_lo)
+        object.__setattr__(self, "z_hi", z_hi)
 
 
 @dataclass(frozen=True)
@@ -232,8 +268,10 @@ class Ray:
 class Source:
     """One face of one leaf participating in a boundary or touch.
 
-    ``face`` is ``"sphere"`` for spheres and one of ``"x_lo"``, ``"x_hi"``,
-    ``"y_lo"``, ``"y_hi"``, ``"z_lo"``, ``"z_hi"`` for boxes.  ``normal`` is
+    ``face`` is ``"sphere"`` for spheres, one of ``"x_lo"``, ``"x_hi"``,
+    ``"y_lo"``, ``"y_hi"``, ``"z_lo"``, ``"z_hi"`` for boxes, and one of
+    ``"side"`` (lateral surface), ``"z_lo"`` / ``"z_hi"`` (bottom / top cap)
+    for cylinders.  ``normal`` is
     the outward unit normal of that face at the hit point, flipped when the
     leaf acts as a subtractor inside :class:`Difference` (``flipped`` is then
     True).  ``kind`` is the leaf-side event kind: ``"enter"``, ``"exit"`` or

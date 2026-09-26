@@ -16,6 +16,7 @@ from fractions import Fraction
 
 from csg_rays import (
     Box,
+    Cylinder,
     Difference,
     Intersection,
     Ray,
@@ -41,6 +42,14 @@ def _in_box(node, p, closed):
     return all(node.mins[i] < p[i] < node.maxs[i] for i in range(3))
 
 
+def _in_cylinder(node, p, closed):
+    radial = (p[0] - node.center[0]) ** 2 + (p[1] - node.center[1]) ** 2
+    r2 = node.radius**2
+    if closed:
+        return radial <= r2 and node.z_lo <= p[2] <= node.z_hi
+    return radial < r2 and node.z_lo < p[2] < node.z_hi
+
+
 def ref_inside(node, p, closed=False):
     """True iff point p (Fraction triple) lies in the solid.
 
@@ -51,6 +60,8 @@ def ref_inside(node, p, closed=False):
         return _in_sphere(node, p, closed)
     if isinstance(node, Box):
         return _in_box(node, p, closed)
+    if isinstance(node, Cylinder):
+        return _in_cylinder(node, p, closed)
     if isinstance(node, Union):
         return any(ref_inside(c, p, closed) for c in node.children)
     if isinstance(node, Intersection):
@@ -88,12 +99,18 @@ def _interior_point(origin, direction, t_float):
 def _random_tree(rng, depth, id_counter):
     if depth == 0 or rng.random() < 0.45:
         leaf_id = f"L{next(id_counter)}"
-        if rng.random() < 0.5:
+        kind = rng.random()
+        if kind < 0.34:
             center = tuple(rng.randint(-3, 3) for _ in range(3))
             return Sphere(center, rng.randint(1, 3), leaf_id)
-        mins = tuple(rng.randint(-3, 2) for _ in range(3))
-        maxs = tuple(m + rng.randint(1, 3) for m in mins)
-        return Box(mins, maxs, leaf_id)
+        if kind < 0.67:
+            mins = tuple(rng.randint(-3, 2) for _ in range(3))
+            maxs = tuple(m + rng.randint(1, 3) for m in mins)
+            return Box(mins, maxs, leaf_id)
+        center = (rng.randint(-3, 3), rng.randint(-3, 3), rng.randint(-2, 2))
+        z_lo = center[2] - rng.randint(1, 3)
+        z_hi = center[2] + rng.randint(1, 3)
+        return Cylinder(center, rng.randint(1, 3), z_lo, z_hi, leaf_id)
     op = rng.choice("uid")
     count = rng.randint(2, 3)
     subs = [_random_tree(rng, depth - 1, id_counter) for _ in range(count)]

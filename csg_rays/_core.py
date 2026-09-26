@@ -33,6 +33,7 @@ from ._types import (
     MAX_TREE_NODES,
     Boundary,
     Box,
+    Cylinder,
     Difference,
     GeometryError,
     Intersection,
@@ -89,7 +90,7 @@ def _validate_and_collect(tree):
                 f"a proper tree (no node may appear twice)"
             )
         seen_nodes.add(id(node))
-        if isinstance(node, (Sphere, Box)):
+        if isinstance(node, (Sphere, Box, Cylinder)):
             if node.leaf_id in leaf_paths:
                 raise GeometryError(
                     f"{path}: duplicate leaf_id {node.leaf_id!r} "
@@ -228,6 +229,133 @@ def _box_events(box, origin, direction):
     return [(enter_t, "enter", tuple(enter_faces)), (exit_t, "exit", tuple(exit_faces))]
 
 
+def _cylinder_events(cylinder, origin, direction):
+    """Events of a finite z-aligned cylinder leaf (side + two caps).
+
+    The solid is the intersection of the radial tube
+    ``(x-cx)^2 + (y-cy)^2 <= r^2`` with the slab ``z_lo <= z <= z_hi``.
+    Generic rays produce enter/exit crossings (cap-edge hits list both the
+    ``"side"`` face and the cap face at the same t).  Degenerate rays are
+    zero-measure contacts: a ray tangent to the side gives one isolated
+    touch, a ray lying on the side surface or on a cap plane gives a
+    zero-thickness tstart/tend contact run, and a ray parallel to the axis
+    inside the tube only crosses the caps.
+    """
+    px = origin[0] - cylinder.center[0]
+    py = origin[1] - cylinder.center[1]
+    oz = origin[2]
+    dx, dy, dz = direction
+    z_lo = cylinder.z_lo
+    z_hi = cylinder.z_hi
+
+    # z-slab restriction
+    z_enter = z_exit = None
+    z_face_enter = z_face_exit = None
+    z_ride_face = None
+    if dz == 0:
+        if oz < z_lo or oz > z_hi:
+            return []  # parallel to the caps and outside the slab: miss
+        if oz == z_lo:
+            z_ride_face = "z_lo"
+        elif oz == z_hi:
+            z_ride_face = "z_hi"
+    else:
+        t_lo_cap = (z_lo - oz) / dz
+        t_hi_cap = (z_hi - oz) / dz
+        if dz > 0:
+            z_enter, z_exit = t_lo_cap, t_hi_cap
+            z_face_enter, z_face_exit = "z_lo", "z_hi"
+        else:
+            z_enter, z_exit = t_hi_cap, t_lo_cap
+            z_face_enter, z_face_exit = "z_hi", "z_lo"
+
+    # radial tube
+    a = dx * dx + dy * dy
+    if a == 0:
+        # ray parallel to the cylinder axis
+        radial2 = px * px + py * py - cylinder.radius ** 2
+        if radial2 > 0:
+            return []  # outside the tube: miss
+        if radial2 == 0:
+            # riding on the side surface: zero-thickness contact run
+            return [
+                (z_enter, "tstart", ("side", z_face_enter)),
+                (z_exit, "tend", ("side", z_face_exit)),
+            ]
+        if dz == 0:
+            raise GeometryError(  # unreachable: direction is non-zero
+                "Cylinder: ray direction is non-zero but has no x/y/z part"
+            )
+        # inside the tube: only the caps are crossed
+        return [
+            (z_enter, "enter", (z_face_enter,)),
+            (z_exit, "exit", (z_face_exit,)),
+        ]
+
+    b = 2 * (px * dx + py * dy)
+    c = px * px + py * py - cylinder.radius ** 2
+    disc = b * b - 4 * a * c
+    if disc < 0:
+        return []  # misses the tube entirely
+    if disc == 0:
+        # tangent to the side surface: zero-measure touch
+        t0 = -b / (2 * a)
+        if dz == 0:
+            faces = ("side",) if z_ride_face is None else ("side", z_ride_face)
+            return [(t0, "touch", faces)]
+        if z_enter <= t0 <= z_exit:
+            faces = ["side"]
+            if t0 == z_enter:
+                faces.append(z_face_enter)
+            if t0 == z_exit:
+                faces.append(z_face_exit)
+            return [(t0, "touch", tuple(faces))]
+        return []  # tangent point lies outside the z range
+
+    sqrt_disc = _sqrt_fraction(disc)
+    if sqrt_disc is not None:
+        t_lo = (-b - sqrt_disc) / (2 * a)
+        t_hi = (-b + sqrt_disc) / (2 * a)
+    else:
+        t_lo = Root(a, b, c, -1)
+        t_hi = Root(a, b, c, +1)
+
+    if dz == 0:
+        if z_ride_face is not None:
+            # ray travels on a cap plane: zero-thickness contact run
+            return [
+                (t_lo, "tstart", ("side", z_ride_face)),
+                (t_hi, "tend", ("side", z_ride_face)),
+            ]
+        return [(t_lo, "enter", ("side",)), (t_hi, "exit", ("side",))]
+
+    # intersect the radial interval [t_lo, t_hi] with the z-slab interval
+    order = cmp_tval(z_enter, t_lo)
+    if order > 0:
+        enter_t, enter_faces = z_enter, [z_face_enter]
+    else:
+        enter_t, enter_faces = t_lo, ["side"]
+        if order == 0:
+            enter_faces.append(z_face_enter)
+    order = cmp_tval(z_exit, t_hi)
+    if order < 0:
+        exit_t, exit_faces = z_exit, [z_face_exit]
+    else:
+        exit_t, exit_faces = t_hi, ["side"]
+        if order == 0:
+            exit_faces.append(z_face_exit)
+    order = cmp_tval(enter_t, exit_t)
+    if order > 0:
+        return []  # radial and z intervals do not overlap: miss
+    if order == 0:
+        # only touches a cap edge circle: isolated zero-measure touch
+        return [(enter_t, "touch", tuple(enter_faces + exit_faces))]
+    return [
+        (enter_t, "enter", tuple(enter_faces)),
+        (exit_t, "exit", tuple(exit_faces)),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # three-valued Boolean evaluation
 # ---------------------------------------------------------------------------
@@ -243,7 +371,7 @@ def _sub_state(positive, negative):
 
 def _make_evaluator(tree, leaf_index):
     def evaluate(node, leaf_state):
-        if isinstance(node, (Sphere, Box)):
+        if isinstance(node, (Sphere, Box, Cylinder)):
             return leaf_state(leaf_index[id(node)])
         if isinstance(node, Union):
             saw_touch = False
@@ -300,6 +428,34 @@ def _sphere_normal(sphere, origin, direction, tval):
         return tuple(float(component) for component in normal)
 
 
+_CYLINDER_CAP_NORMALS = {
+    "z_lo": (0.0, 0.0, -1.0),
+    "z_hi": (0.0, 0.0, 1.0),
+}
+
+
+def _cylinder_side_normal(cylinder, origin, direction, tval):
+    """Outward unit normal of the lateral surface at the hit point."""
+    if isinstance(tval, Fraction):
+        nx = (origin[0] + tval * direction[0] - cylinder.center[0]) / cylinder.radius
+        ny = (origin[1] + tval * direction[1] - cylinder.center[1]) / cylinder.radius
+        return (float(nx), float(ny), 0.0)
+    with localcontext() as ctx:
+        ctx.prec = 70
+        t_dec = tval.decimal(70)
+        nx = (
+            frac_to_decimal(origin[0])
+            + t_dec * frac_to_decimal(direction[0])
+            - frac_to_decimal(cylinder.center[0])
+        ) / frac_to_decimal(cylinder.radius)
+        ny = (
+            frac_to_decimal(origin[1])
+            + t_dec * frac_to_decimal(direction[1])
+            - frac_to_decimal(cylinder.center[1])
+        ) / frac_to_decimal(cylinder.radius)
+        return (float(nx), float(ny), 0.0)
+
+
 # ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
@@ -327,8 +483,10 @@ def ray_intervals(tree, ray):
     for leaf in leaves:
         if isinstance(leaf, Sphere):
             leaf_events.append(_sphere_events(leaf, origin, direction))
-        else:
+        elif isinstance(leaf, Box):
             leaf_events.append(_box_events(leaf, origin, direction))
+        else:
+            leaf_events.append(_cylinder_events(leaf, origin, direction))
 
     # -- exact clustering of coincident event parameters -----------------
     all_tvals = [tval for events in leaf_events for (tval, _kind, _faces) in events]
@@ -570,8 +728,12 @@ def ray_intervals(tree, ray):
 def _make_source(leaf, face, kind, tval, origin, direction, polarity):
     if isinstance(leaf, Sphere):
         normal = _sphere_normal(leaf, origin, direction, tval)
-    else:
+    elif isinstance(leaf, Box):
         normal = _BOX_NORMALS[face]
+    elif face == "side":
+        normal = _cylinder_side_normal(leaf, origin, direction, tval)
+    else:
+        normal = _CYLINDER_CAP_NORMALS[face]
     flipped = polarity < 0
     if flipped:
         normal = tuple(-component for component in normal)

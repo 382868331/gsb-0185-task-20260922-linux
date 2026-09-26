@@ -2,8 +2,8 @@
 
 Public interface:
 
-* Tree nodes: :class:`Sphere`, :class:`Box` (leaves) and :class:`Union`,
-  :class:`Intersection`, :class:`Difference` (internal nodes).
+* Tree nodes: :class:`Sphere`, :class:`Box`, :class:`Cylinder` (leaves) and
+  :class:`Union`, :class:`Intersection`, :class:`Difference` (internal nodes).
 * :class:`Ray` and the entry point :func:`ray_intervals`.
 * Output: :class:`RayIntervalsResult` with :class:`Interval`, :class:`Touch`,
   :class:`Boundary` and :class:`Source`.
@@ -21,6 +21,7 @@ from ._types import (
     Box,
     CertificationBudgetExhausted,
     CSGError,
+    Cylinder,
     Difference,
     GeometryError,
     Intersection,
@@ -39,6 +40,7 @@ __all__ = [
     "Box",
     "CertificationBudgetExhausted",
     "CSGError",
+    "Cylinder",
     "Difference",
     "GeometryError",
     "Intersection",
