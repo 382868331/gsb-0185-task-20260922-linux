@@ -41,9 +41,12 @@ from ._types import (
     RayIntervalsResult,
     Source,
     Sphere,
+    Transform,
     Touch,
     Union,
     _is_node,
+    _IDENTITY3,
+    _ZERO3,
 )
 
 _IN = "IN"
@@ -69,14 +72,21 @@ _BOX_NORMALS = {
 # ---------------------------------------------------------------------------
 
 def _validate_and_collect(tree):
-    """Check tree structure; return (leaves, polarities) in traversal order."""
+    """Check tree structure; collect leaves with polarity and world frame.
+
+    Returns ``(leaves, polarities, frames)`` where each frame is
+    ``(world_linear, world_inverse, world_offset)`` for the affine map
+    ``x_world = world_linear @ x_local + world_offset`` accumulated through
+    every enclosing :class:`Transform`.
+    """
     leaves = []
     polarities = []
+    frames = []
     seen_nodes = set()
     leaf_paths = {}
     count = 0
 
-    def walk(node, polarity, path):
+    def walk(node, polarity, path, linear, inverse, offset):
         nonlocal count
         count += 1
         if count > MAX_TREE_NODES:
@@ -98,20 +108,49 @@ def _validate_and_collect(tree):
             leaf_paths[node.leaf_id] = path
             leaves.append(node)
             polarities.append(polarity)
+            frames.append((linear, inverse, offset))
         elif isinstance(node, (Union, Intersection)):
             for i, child in enumerate(node.children):
-                walk(child, polarity, f"{path}.children[{i}]")
+                walk(child, polarity, f"{path}.children[{i}]", linear, inverse, offset)
         elif isinstance(node, Difference):
-            walk(node.positive, polarity, f"{path}.positive")
+            walk(node.positive, polarity, f"{path}.positive", linear, inverse, offset)
             for i, sub in enumerate(node.subtractors):
-                walk(sub, -polarity, f"{path}.subtractors[{i}]")
+                walk(
+                    sub, -polarity, f"{path}.subtractors[{i}]",
+                    linear, inverse, offset,
+                )
+        elif isinstance(node, Transform):
+            # x_parent = node.linear @ x_child + node.translation
+            # compose with x_world = linear @ x_parent + offset:
+            new_linear = tuple(
+                tuple(
+                    sum(linear[i][k] * node.linear[k][j] for k in range(3))
+                    for j in range(3)
+                )
+                for i in range(3)
+            )
+            new_offset = tuple(
+                sum(linear[i][k] * node.translation[k] for k in range(3)) + offset[i]
+                for i in range(3)
+            )
+            new_inverse = tuple(
+                tuple(
+                    sum(node._inverse[i][k] * inverse[k][j] for k in range(3))
+                    for j in range(3)
+                )
+                for i in range(3)
+            )
+            walk(
+                node.child, polarity, f"{path}.child",
+                new_linear, new_inverse, new_offset,
+            )
         else:
             raise GeometryError(
                 f"{path}: not a CSG node ({type(node).__name__})"
             )
 
-    walk(tree, 1, "tree")
-    return leaves, polarities
+    walk(tree, 1, "tree", _IDENTITY3, _IDENTITY3, _ZERO3)
+    return leaves, polarities, frames
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +307,8 @@ def _make_evaluator(tree, leaf_index):
             for sub in node.subtractors:
                 result = _sub_state(result, evaluate(sub, leaf_state))
             return result
+        if isinstance(node, Transform):
+            return evaluate(node.child, leaf_state)
         raise GeometryError(f"tree: not a CSG node ({type(node).__name__})")
 
     return evaluate
@@ -277,14 +318,14 @@ def _make_evaluator(tree, leaf_index):
 # normals
 # ---------------------------------------------------------------------------
 
-def _sphere_normal(sphere, origin, direction, tval):
-    """Outward unit normal at the hit point (exact when tval is rational)."""
+def _sphere_local_normal(sphere, origin, direction, tval):
+    """Outward unit normal in leaf coordinates (exact when tval rational)."""
     if isinstance(tval, Fraction):
         normal = [
             (origin[i] + tval * direction[i] - sphere.center[i]) / sphere.radius
             for i in range(3)
         ]
-        return tuple(float(component) for component in normal)
+        return list(normal)
     with localcontext() as ctx:
         ctx.prec = 70
         t_dec = tval.decimal(70)
@@ -297,7 +338,36 @@ def _sphere_normal(sphere, origin, direction, tval):
             / frac_to_decimal(sphere.radius)
             for i in range(3)
         ]
-        return tuple(float(component) for component in normal)
+        return list(normal)
+
+
+def _box_local_normal(face):
+    """Outward face normal in the leaf local coordinates as Fractions."""
+    axis = 'xyz'.index(face[0])
+    sign = 1 if face.endswith('_hi') else -1
+    return [Fraction(sign) if i == axis else Fraction(0) for i in range(3)]
+
+
+def _world_normal(local_normal, inverse, is_decimal=False):
+    """Map an outward leaf-space normal back to world coordinates.
+
+    With ``x_world = L x_local + b`` the implicit surface gradient obeys
+    ``n_world = L^{-T} n_local``; ``inverse`` is ``L^{-1}``.  The vector is
+    then normalized in world space, so non-uniform scaling produces the
+    correct slanted face normal.
+    """
+    if is_decimal:
+        d_world = [
+            sum(frac_to_decimal(inverse[j][i]) * local_normal[j] for j in range(3))
+            for i in range(3)
+        ]
+    else:
+        d_world = [
+            frac_to_decimal(sum(inverse[j][i] * local_normal[j] for j in range(3)))
+            for i in range(3)
+        ]
+    d_length = sum(component * component for component in d_world).sqrt()
+    return tuple(float(component / d_length) + 0.0 for component in d_world)
 
 
 # ---------------------------------------------------------------------------
@@ -318,17 +388,33 @@ def ray_intervals(tree, ray):
     origin = ray.origin
     direction = ray.direction
 
-    leaves, polarities = _validate_and_collect(tree)
+    leaves, polarities, frames = _validate_and_collect(tree)
     leaf_index = {id(leaf): i for i, leaf in enumerate(leaves)}
     evaluate = _make_evaluator(tree, leaf_index)
 
     # -- per-leaf events -------------------------------------------------
     leaf_events = []
-    for leaf in leaves:
+    leaf_rays = []
+    for li, leaf in enumerate(leaves):
+        _world_linear, world_inverse, world_offset = frames[li]
+        # x_local = L^{-1} (x_world - b); affine in t, so the hit parameter t
+        # is identical in both frames -- events need no re-mapping.
+        local_origin = tuple(
+            sum(
+                world_inverse[i][j] * (origin[j] - world_offset[j])
+                for j in range(3)
+            )
+            for i in range(3)
+        )
+        local_direction = tuple(
+            sum(world_inverse[i][j] * direction[j] for j in range(3))
+            for i in range(3)
+        )
+        leaf_rays.append((local_origin, local_direction))
         if isinstance(leaf, Sphere):
-            leaf_events.append(_sphere_events(leaf, origin, direction))
+            leaf_events.append(_sphere_events(leaf, local_origin, local_direction))
         else:
-            leaf_events.append(_box_events(leaf, origin, direction))
+            leaf_events.append(_box_events(leaf, local_origin, local_direction))
 
     # -- exact clustering of coincident event parameters -----------------
     all_tvals = [tval for events in leaf_events for (tval, _kind, _faces) in events]
@@ -473,7 +559,8 @@ def ray_intervals(tree, ray):
                     found.append(
                         _make_source(
                             leaf, face, source_kind, clusters[ci],
-                            origin, direction, polarities[li],
+                            leaf_rays[li][0], leaf_rays[li][1],
+                            frames[li], polarities[li],
                         )
                     )
         found.sort(key=lambda s: (s.leaf_id, s.face))
@@ -567,11 +654,24 @@ def ray_intervals(tree, ray):
     )
 
 
-def _make_source(leaf, face, kind, tval, origin, direction, polarity):
+def _make_source(leaf, face, kind, tval, origin, direction, frame, polarity):
+    _world_linear, world_inverse, _world_offset = frame
+    identity_frame = world_inverse is _IDENTITY3 or world_inverse == _IDENTITY3
     if isinstance(leaf, Sphere):
-        normal = _sphere_normal(leaf, origin, direction, tval)
+        local_normal = _sphere_local_normal(leaf, origin, direction, tval)
+        if identity_frame:
+            normal = tuple(float(c) for c in local_normal)
+        else:
+            normal = _world_normal(
+                local_normal, world_inverse,
+                is_decimal=not isinstance(tval, Fraction),
+            )
     else:
-        normal = _BOX_NORMALS[face]
+        if identity_frame:
+            normal = _BOX_NORMALS[face]
+        else:
+            local_normal = _box_local_normal(face)
+            normal = _world_normal(local_normal, world_inverse)
     flipped = polarity < 0
     if flipped:
         normal = tuple(-component for component in normal)

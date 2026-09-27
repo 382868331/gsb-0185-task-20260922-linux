@@ -1,9 +1,9 @@
 # csg_rays — 带空腔的 CSG 射线区间求交
 
 离线 CAD 几何工程用可复用模块：对 CSG 树（叶仅球与轴对齐盒，内部节点
-union / intersection / difference）与一条射线求交，输出排序不相交的实体
-t 区间、零测度相切接触、带进入/退出面来源的实体边界，以及最近正向实体
-边界。
+union / intersection / difference，并支持可嵌套的平移 / 旋转 / 非均匀缩
+放仿射变换节点）与一条射线求交，输出排序不相交的实体 t 区间、零测度
+相切接触、带进入/退出面来源的实体边界，以及最近正向实体边界。
 
 * **Python 版本**：3.14.7（仅用标准库：`fractions` / `decimal` / `math` /
   `dataclasses` / `functools`）。
@@ -21,6 +21,7 @@ python demo.py                            # 运行演示（约 0.1 秒内完成�
 ```python
 from csg_rays import (
     Sphere, Box, Union, Intersection, Difference, Ray,
+    Transform, Translate, Scale, Rotate,
     ray_intervals,
     RayIntervalsResult, Interval, Touch, Boundary, Source,
     CSGError, GeometryError, CertificationBudgetExhausted,
@@ -31,6 +32,11 @@ tree = Difference(Sphere((0, 0, 0), 5, "outer"), Sphere((0, 0, 0), 2, "inner"))
 res = ray_intervals(tree, Ray((-10, 0, 0), (1, 0, 0)))
 # res.intervals -> (Interval(5.0, 8.0, ...), Interval(12.0, 15.0, ...))
 # res.nearest_boundary -> Boundary(t=5.0, kind="enter", ...)
+
+# transform a whole sub-combination without editing its primitives:
+shaped = Translate(Scale(tree, (2, 1, 1)), (0, 100, 0))
+ray_intervals(shaped, Ray((-20, 100, 0), (1, 0, 0)))
+# intervals -> (10.0, 16.0), (24.0, 30.0); cavity normals face world +/-x
 ```
 
 ### 树节点
@@ -41,11 +47,24 @@ res = ray_intervals(tree, Ray((-10, 0, 0), (1, 0, 0)))
 | `Box(mins, maxs, leaf_id)` | 轴对齐实体盒叶。每轴 `maxs[i] > mins[i]`。 |
 | `Union(children)` / `Intersection(children)` | n 元并 / 交，`children` 非空可迭代。 |
 | `Difference(positive, *subtractors)` | 正体减去一个或多个减体（正则化差，减体按闭实体处理）。 |
+| `Translate(child, offset)` | 整体平移一个子组合（`offset` 为 3 维向量）。 |
+| `Scale(child, factors)` | 三轴非均匀缩放；各因子必须**非零**，允许负值（镜像）。 |
+| `Rotate(child, matrix)` | 以 3×3 可逆矩阵对一个子组合做线性旋转/正交变换。 |
+| `Transform(child, linear=None, translation=None)` | 通用仿射
+  `x_world = linear·x_local + translation`；`linear` 缺省为单位阵、
+  `translation` 缺省为零向量。 |
 | `Ray(origin, direction)` | 射线 `origin + t*direction`，`t ∈ ℝ`（整条直线）；`direction` 必须非零。 |
 
 数值字段接受 `int` 或有限 `float`，内部一律转为精确的
 `fractions.Fraction` 保存（节点上的 `center`/`radius`/`mins`/`maxs` 等属性
-即 Fraction 值）。`leaf_id` 必须是非空 `str`，且在整棵树内唯一。
+即 Fraction 值；`Rotate`/`Transform` 的矩阵与平移也按 Fraction 精确保
+存）。`leaf_id` 必须是非空 `str`，且在整棵树内唯一。
+
+变换节点可任意嵌套，并可包住任意子树（布尔节点或其他变换）。变换在
+构造时即用精确 Fraction 计算行列式并求逆：**不可逆（奇异）的矩阵在构
+造阶段就被拒绝**，不会拖到射线计算时。`Scale` 的零因子、`Rotate` 的
+奇异矩阵同属此类错误。`Rotate` 只要求可逆，不强制精确正交，因此带
+sin/cos 的有限 float 旋转矩阵可直接使用。
 
 ### 输出结构
 
@@ -78,14 +97,27 @@ res = ray_intervals(tree, Ray((-10, 0, 0), (1, 0, 0)))
   结果状态时，该叶面才计入 `sources`；因此无影响的重合事件不会出现
   在来源列表中。
 * **射线是整条直线**：区间覆盖所有 `t ∈ ℝ`；`nearest_boundary` 额外筛
-  选 `t > 0`（"最近正向"）。从实体/空腔内部起射时，负 t 区间同样给出。
+  选 `t > 0`（“最近正向”）。从实体/空腔内部起射时，负 t 区间同样给出。
+* **变换的处理**：遍历树时沿嵌套链累计世界坐标到叶局部坐标的仿射映
+  射（精确 Fraction 矩阵），把射线原点与方向变到叶空间再求交。仿射变
+  换对 t 是线性的（`o_w + t·d_w` 映入局部仍为 `o_l + t·d_l`），所以射
+  线参数 t 在两坐标系中完全相同，事件参数、区间端点与“最近正向”无
+  需重映射。
+* **法向换回原坐标**：叶空间外法向按 L⁻ᵀ 规则映回世界坐标（对隐式曲
+  面梯度精确成立），再在世界坐标归一化；非均匀缩放下盒面/球面的倾
+  斜法向由此正确给出。`Difference` 减体内表面的法向在世界法向基础上
+  再翻转（嵌套差按奇偶累计），空腔出入面朝向不会翻错。
+* **无变换时结果一致**：无任何变换节点时走恒等映射路径，区间端点与
+  边界法向与未加变换功能时逐位一致（球法向仍为精确分式或 70 位
+  Decimal，盒法向仍为精确轴向量）。
 
 ## 输入上限与错误语义
 
-* 树节点总数（叶 + 内部节点）≤ `MAX_TREE_NODES = 100`；树不得共享节点
-  （同一对象出现两次即报错）；`leaf_id` 全局唯一。
+* 树节点总数（叶 + 内部节点，含变换节点）≤ `MAX_TREE_NODES = 100`；树
+  不得共享节点（同一对象出现两次即报错）；`leaf_id` 全局唯一。
 * 数值输入拒绝 `bool`、NaN、Infinity；向量必须恰为 3 个数值；球半径
-  `> 0`；盒 `maxs[i] > mins[i]`；射线方向非零。
+  `> 0`；盒 `maxs[i] > mins[i]`；射线方向非零；变换矩阵必须恰为 3×3
+  数值且行列式非零（精确 Fraction 判定），缩放因子非零。
 * 非法输入抛出 `GeometryError`，消息含可定位路径（如
   `Sphere(leaf_id='s1').center[2]: ...`、`tree.children[0].positive: ...`），
   不做任何静默纠正。`ray_intervals` 为纯函数：输入校验失败时不产生任
@@ -107,7 +139,9 @@ res = ray_intervals(tree, Ray((-10, 0, 0), (1, 0, 0)))
 * 仅在输出边界做一次舍入：`t` 经 `float()` 转换，有理端点误差 ≤ 1
   ulp；无理端点先取 80 位 Decimal 再转 float，相对误差 ≲ 1e-15。
 * 法向：盒面法向精确；球法向在命中点精确计算（有理 t）或经 70 位
-  Decimal（无理 t），相对误差 ≲ 1e-15。
+  Decimal（无理 t）。变换图元的法向在世界坐标用精确 Fraction 组合后
+  仅做一次 Decimal 归一化（无理 t 的球使用 70 位 Decimal），相对误差
+  ≲ 1e-15。
 * 因此边界之间不存在"宽容差"：区间不相交、不重叠是由精确排序保证的，
   不是靠 epsilon 合并。
 
@@ -124,9 +158,11 @@ res = ray_intervals(tree, Ray((-10, 0, 0), (1, 0, 0)))
 
 ## 已知限制
 
-* 叶仅球与轴对齐盒（无旋转盒、无其他图元、无变换节点）；布尔算子仅
-  union / intersection / difference。这是本题的数学子集，不宣称完整
-  CAD 内核或行业标准兼容。
+* 叶仅球与轴对齐盒；经仿射变换可得到平移 / 旋转 / 非均匀缩放后的球、
+  盒及其子组合（无其他图元类型）；布尔算子仅 union / intersection /
+  difference。这是本题的数学子集，不宣称完整 CAD 内核或行业标准兼容。
+* `Rotate` 不强制矩阵正交（只验证可逆）；需要严格保持长度的单位旋转
+  时，调用方应自行保证传入正交矩阵。
 * 树为真树（不允许节点共享）；节点数上限 100 为接口边界。
 * 输出 t 与法向为 float（误差口径见上）；需要完全精确结果时可基于节
   点中的 Fraction 输入自行重算。
@@ -145,6 +181,7 @@ csg_rays/           # 库本体（纯标准库）
   _core.py          # 叶事件生成、三值扫描、区间/边界/接触装配
 tests/
   test_analytic.py  # 解析精确端点（同心空心球）、重合盒面、切线、内部起射、错误语义
+  test_transforms.py# 平移/旋转/非均匀缩放/剪切的端点与世界法向、嵌套、不可逆拒绝
   test_sampling.py  # 独立参考分类器的小采样成员测试（不调用被测核心）
-demo.py             # 固定输入演示：空心球空腔出入面 + 实际触发的输入拒绝
+demo.py             # 固定输入演示：空心球空腔出入面、整子组合缩放平移 + 实际触发的拒绝
 ```

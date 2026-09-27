@@ -79,8 +79,78 @@ def _as_leaf_id(value, path):
     return value
 
 
+def _as_mat3(value, path):
+    """Validate a 3x3 matrix of numbers; return a Fraction row tuple."""
+    if isinstance(value, (str, bytes)):
+        raise GeometryError(f"{path}: expected a 3x3 matrix, got str/bytes")
+    try:
+        rows = tuple(value)
+    except TypeError:
+        raise GeometryError(f"{path}: expected a 3x3 matrix, got {type(value).__name__}")
+    if len(rows) != 3:
+        raise GeometryError(f"{path}: expected 3 rows, got {len(rows)}")
+    matrix = []
+    for i, row in enumerate(rows):
+        if isinstance(row, (str, bytes)):
+            raise GeometryError(f"{path}[{i}]: expected a row of 3 numbers, got str/bytes")
+        try:
+            items = tuple(row)
+        except TypeError:
+            raise GeometryError(
+                f"{path}[{i}]: expected a row of 3 numbers, got {type(row).__name__}"
+            )
+        if len(items) != 3:
+            raise GeometryError(f"{path}[{i}]: expected 3 columns, got {len(items)}")
+        matrix.append(
+            tuple(_as_number(v, f"{path}[{i}][{j}]") for j, v in enumerate(items))
+        )
+    return tuple(matrix)
+
+
+def _mat3_determinant(matrix):
+    a, b, c = matrix[0]
+    d, e, f = matrix[1]
+    g, h, i = matrix[2]
+    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+
+def _mat3_inverse(matrix):
+    """Exact inverse of an invertible 3x3 Fraction matrix."""
+    (a, b, c), (d, e, f), (g, h, i) = matrix
+    det = _mat3_determinant(matrix)
+    cofactors = (
+        (e * i - f * h, c * h - b * i, b * f - c * e),
+        (f * g - d * i, a * i - c * g, c * d - a * f),
+        (d * h - e * g, b * g - a * h, a * e - b * d),
+    )
+    return tuple(
+        tuple(cofactors[row][col] / det for col in range(3)) for row in range(3)
+    )
+
+
+def _mat3_mul(left, right):
+    return tuple(
+        tuple(
+            sum(left[i][k] * right[k][j] for k in range(3))
+            for j in range(3)
+        )
+        for i in range(3)
+    )
+
+
+_IDENTITY3 = (
+    (Fraction(1), Fraction(0), Fraction(0)),
+    (Fraction(0), Fraction(1), Fraction(0)),
+    (Fraction(0), Fraction(0), Fraction(1)),
+)
+_ZERO3 = (Fraction(0), Fraction(0), Fraction(0))
+
+
 def _is_node(value):
-    return isinstance(value, (Sphere, Box, Union, Intersection, Difference))
+    return isinstance(
+        value,
+        (Sphere, Box, Union, Intersection, Difference, Transform),
+    )
 
 
 def _check_children(children, path):
@@ -203,6 +273,101 @@ class Difference:
             and self.positive == other.positive
             and self.subtractors == other.subtractors
         )
+
+
+class Transform:
+    """Affine transform ``x_world = linear @ x_local + translation``.
+
+    Nests freely: the child may be any CSG node, including another
+    transform.  ``linear`` must be an invertible 3x3 matrix of numbers
+    (its determinant is checked exactly); singular matrices are rejected at
+    construction time because the inverse is needed to map the ray into the
+    child's coordinates.  Use :class:`Translate`, :class:`Scale` and
+    :class:`Rotate` for the named convenience forms.
+    """
+
+    __slots__ = ("child", "linear", "translation", "_inverse", "_label")
+
+    def __init__(
+        self, child, linear=None, translation=None, *,
+        _label="Transform", _matrix=None,
+    ):
+        if _matrix is not None:
+            matrix = _matrix
+        else:
+            matrix = _IDENTITY3 if linear is None else _as_mat3(
+                linear, f"{_label}.linear"
+            )
+        if _mat3_determinant(matrix) == 0:
+            raise GeometryError(
+                f"{_label}.linear: matrix is singular (determinant 0); the "
+                f"transform must be invertible"
+            )
+        offset = _ZERO3 if translation is None else _as_vec3(
+            translation, f"{_label}.translation"
+        )
+        if not _is_node(child):
+            raise GeometryError(
+                f"{_label}.child: not a CSG node ({type(child).__name__})"
+            )
+        self.child = child
+        self.linear = matrix
+        self.translation = offset
+        self._inverse = _mat3_inverse(matrix)
+        self._label = _label
+
+    def __repr__(self):
+        return (
+            f"{self._label}(child={self.child!r}, linear={self.linear!r}, "
+            f"translation={self.translation!r})"
+        )
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Transform)
+            and self.child == other.child
+            and self.linear == other.linear
+            and self.translation == other.translation
+        )
+
+
+class Translate(Transform):
+    """Pure translation of a sub-combination by ``offset``."""
+
+    def __init__(self, child, offset):
+        super().__init__(child, translation=offset, _label="Translate")
+
+
+class Scale(Transform):
+    """Per-axis non-uniform scaling; every factor must be non-zero.
+
+    Negative factors are accepted (scale combined with a reflection);
+    a zero factor makes the transform singular and is rejected.
+    """
+
+    def __init__(self, child, factors):
+        path = "Scale.factors"
+        values = _as_vec3(factors, path)
+        for i, factor in enumerate(values):
+            if factor == 0:
+                raise GeometryError(f"{path}[{i}]: scale factor must be non-zero")
+        linear = tuple(
+            tuple(values[i] if i == j else Fraction(0) for j in range(3))
+            for i in range(3)
+        )
+        super().__init__(child, _label="Scale", _matrix=linear)
+
+
+class Rotate(Transform):
+    """Linear rotation/isometry given by an invertible 3x3 matrix.
+
+    Only invertibility is required (exact determinant check); exact
+    orthogonality is not enforced, so finite ``float`` rotation matrices
+    with irrational entries (sin/cos) are accepted.
+    """
+
+    def __init__(self, child, matrix):
+        super().__init__(child, linear=matrix, _label="Rotate")
 
 
 @dataclass(frozen=True)

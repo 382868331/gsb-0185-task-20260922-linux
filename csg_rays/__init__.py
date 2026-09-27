@@ -2,8 +2,10 @@
 
 Public interface:
 
-* Tree nodes: :class:`Sphere`, :class:`Box` (leaves) and :class:`Union`,
-  :class:`Intersection`, :class:`Difference` (internal nodes).
+* Tree nodes: :class:`Sphere`, :class:`Box` (leaves); :class:`Union`,
+  :class:`Intersection`, :class:`Difference` (Boolean nodes) and nestable
+  affine transforms :class:`Transform`, :class:`Translate`, :class:`Scale`,
+  :class:`Rotate`.
 * :class:`Ray` and the entry point :func:`ray_intervals`.
 * Output: :class:`RayIntervalsResult` with :class:`Interval`, :class:`Touch`,
   :class:`Boundary` and :class:`Source`.
@@ -27,9 +29,13 @@ from ._types import (
     Interval,
     Ray,
     RayIntervalsResult,
+    Rotate,
+    Scale,
     Source,
     Sphere,
     Touch,
+    Transform,
+    Translate,
     Union,
 )
 
@@ -45,9 +51,13 @@ __all__ = [
     "Interval",
     "Ray",
     "RayIntervalsResult",
+    "Rotate",
+    "Scale",
     "Source",
     "Sphere",
     "Touch",
+    "Transform",
+    "Translate",
     "Union",
     "ray_intervals",
 ]
