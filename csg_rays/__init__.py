@@ -29,7 +29,11 @@ from ._types import (
     RayIntervalsResult,
     Source,
     Sphere,
+    Rotate,
+    Scale,
     Touch,
+    Transform,
+    Translate,
     Union,
 )
 
@@ -46,8 +50,12 @@ __all__ = [
     "Ray",
     "RayIntervalsResult",
     "Source",
+    "Rotate",
+    "Scale",
     "Sphere",
     "Touch",
+    "Transform",
+    "Translate",
     "Union",
     "ray_intervals",
 ]

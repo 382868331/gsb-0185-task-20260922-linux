@@ -48,7 +48,7 @@ class CertificationBudgetExhausted(CSGError):
 
 def _as_number(value, path):
     """Validate a single numeric input and return it as an exact Fraction."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Fraction)):
         raise GeometryError(
             f"{path}: expected int or float (bool is not accepted), "
             f"got {type(value).__name__}"
@@ -80,7 +80,123 @@ def _as_leaf_id(value, path):
 
 
 def _is_node(value):
-    return isinstance(value, (Sphere, Box, Union, Intersection, Difference))
+    return isinstance(
+        value,
+        (Sphere, Box, Union, Intersection, Difference, Transform),
+    )
+
+
+def _as_matrix3(value, path):
+    """Validate an invertible 3x3 numeric matrix and return Fractions."""
+    if isinstance(value, (str, bytes)):
+        raise GeometryError(f"{path}: expected a 3x3 sequence, got str/bytes")
+    try:
+        rows = tuple(value)
+    except TypeError:
+        raise GeometryError(f"{path}: expected a 3x3 sequence")
+    if len(rows) != 3:
+        raise GeometryError(f"{path}: expected 3 rows, got {len(rows)}")
+    matrix = []
+    for i, row in enumerate(rows):
+        if isinstance(row, (str, bytes)):
+            raise GeometryError(f"{path}[{i}]: expected a row of 3 numbers")
+        try:
+            items = tuple(row)
+        except TypeError:
+            raise GeometryError(f"{path}[{i}]: expected a row of 3 numbers")
+        if len(items) != 3:
+            raise GeometryError(
+                f"{path}[{i}]: expected 3 columns, got {len(items)}"
+            )
+        matrix.append(
+            tuple(_as_number(v, f"{path}[{i}][{j}]") for j, v in enumerate(items))
+        )
+    determinant = _det3(matrix)
+    if determinant == 0:
+        raise GeometryError(f"{path}: transform matrix is singular and cannot be inverted")
+    return tuple(matrix)
+
+
+def _det3(m):
+    return (
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    )
+
+
+def _identity3():
+    return (
+        (Fraction(1), Fraction(0), Fraction(0)),
+        (Fraction(0), Fraction(1), Fraction(0)),
+        (Fraction(0), Fraction(0), Fraction(1)),
+    )
+
+
+def _mat_mul(a, b):
+    return tuple(
+        tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3))
+        for i in range(3)
+    )
+
+
+def _rotation_matrix(angle, axis, path):
+    angle_value = _as_number(angle, f"{path}.angle")
+    axis_value = _as_vec3(axis, f"{path}.axis")
+    if all(component == 0 for component in axis_value):
+        raise GeometryError(f"{path}.axis: rotation axis must be non-zero")
+
+    angle_float = float(angle_value)
+    quadrant = round(angle_float / (math.pi / 2))
+    if math.isclose(angle_float, quadrant * math.pi / 2, rel_tol=1e-12, abs_tol=1e-12):
+        c = Fraction((1, 0, -1, 0)[quadrant % 4])
+        s = Fraction((0, 1, 0, -1)[quadrant % 4])
+        axis_length_squared = sum(component * component for component in axis_value)
+        axis_length = axis_length_squared.numerator
+        denominator = axis_length_squared.denominator
+        root_num = math.isqrt(axis_length)
+        root_den = math.isqrt(denominator)
+        if root_num * root_num == axis_length and root_den * root_den == denominator:
+            length = Fraction(root_num, root_den)
+            u = tuple(component / length for component in axis_value)
+            zero = Fraction(0)
+            one = Fraction(1)
+            return tuple(
+                tuple(
+                    c * (one if i == j else zero)
+                    + s * (
+                        u[(i + 1) % 3] * u[(j + 2) % 3]
+                        - u[(i + 2) % 3] * u[(j + 1) % 3]
+                    )
+                    + (one - c) * u[i] * u[j]
+                    for j in range(3)
+                )
+                for i in range(3)
+            )
+
+    # A non-right-angle float rotation is stored as the exact rational value
+    # of its binary-float trigonometric matrix.  This keeps later ray algebra
+    # exact for that explicitly supplied floating-point transform.
+    axis_float = tuple(float(v) for v in axis_value)
+    length = math.sqrt(sum(v * v for v in axis_float))
+    u = tuple(v / length for v in axis_float)
+    c_float = math.cos(angle_float)
+    s_float = math.sin(angle_float)
+    values = []
+    axis_squared = sum(v * v for v in axis_float)
+    for i in range(3):
+        row = []
+        for j in range(3):
+            cross = (
+                u[(i + 1) % 3] * u[(j + 2) % 3]
+                - u[(i + 2) % 3] * u[(j + 1) % 3]
+            )
+            row.append(Fraction(c_float * (1.0 if i == j else 0.0)
+                                + s_float * cross
+                                + (1.0 - c_float) * axis_float[i] * axis_float[j]
+                                / axis_squared))
+        values.append(tuple(row))
+    return _as_matrix3(values, path + ".matrix")
 
 
 def _check_children(children, path):
@@ -203,6 +319,102 @@ class Difference:
             and self.positive == other.positive
             and self.subtractors == other.subtractors
         )
+
+
+class Transform:
+    """Invertible affine transform ``p_world = M p_local + translation``."""
+
+    __slots__ = ("child", "matrix", "translation")
+
+    def __init__(self, child, matrix=None, translation=None):
+        path = "Transform"
+        if not _is_node(child):
+            raise GeometryError(
+                f"{path}.child: not a CSG node ({type(child).__name__})"
+            )
+        if matrix is None:
+            matrix = _identity3()
+        else:
+            matrix = _as_matrix3(matrix, f"{path}.matrix")
+        if translation is None:
+            translation = (Fraction(0),) * 3
+        else:
+            translation = _as_vec3(translation, f"{path}.translation")
+        self.child = child
+        self.matrix = matrix
+        self.translation = translation
+
+    def __repr__(self):
+        return (
+            f"Transform({self.child!r}, matrix={self.matrix!r}, "
+            f"translation={self.translation!r})"
+        )
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Transform)
+            and self.child == other.child
+            and self.matrix == other.matrix
+            and self.translation == other.translation
+        )
+
+
+class Translate(Transform):
+    """Translate a child subtree by ``offset``."""
+
+    def __init__(self, child, offset):
+        super().__init__(
+            child,
+            translation=_as_vec3(offset, "Translate.offset"),
+        )
+
+
+class Rotate(Transform):
+    """Right-handed rotation by ``angle`` radians around ``axis``."""
+
+    def __init__(self, child, angle, axis, center=None):
+        path = "Rotate"
+        rotation = _rotation_matrix(angle, axis, path)
+        if center is None:
+            translation = (Fraction(0),) * 3
+        else:
+            center_value = _as_vec3(center, f"{path}.center")
+            translation = tuple(
+                center_value[i]
+                - sum(rotation[i][j] * center_value[j] for j in range(3))
+                for i in range(3)
+            )
+        super().__init__(child, matrix=rotation, translation=translation)
+
+
+class Scale(Transform):
+    """Independent per-axis scaling; every factor must be non-zero."""
+
+    def __init__(self, child, factors, center=None):
+        path = "Scale"
+        if isinstance(factors, (int, float)) and not isinstance(factors, bool):
+            factor_value = _as_number(factors, f"{path}.factors")
+            factors_value = (factor_value, factor_value, factor_value)
+        else:
+            factors_value = _as_vec3(factors, f"{path}.factors")
+        for i, factor in enumerate(factors_value):
+            if factor == 0:
+                raise GeometryError(
+                    f"{path}.factors[{i}]: scale factor must be non-zero"
+                )
+        matrix = tuple(
+            tuple(factors_value[i] if i == j else Fraction(0) for j in range(3))
+            for i in range(3)
+        )
+        if center is None:
+            translation = (Fraction(0),) * 3
+        else:
+            center_value = _as_vec3(center, f"{path}.center")
+            translation = tuple(
+                center_value[i] - matrix[i][i] * center_value[i]
+                for i in range(3)
+            )
+        super().__init__(child, matrix=matrix, translation=translation)
 
 
 @dataclass(frozen=True)

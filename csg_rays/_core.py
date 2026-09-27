@@ -25,7 +25,7 @@ Pipeline of :func:`ray_intervals`:
 from __future__ import annotations
 
 import math
-from decimal import localcontext
+from decimal import Decimal, localcontext
 from fractions import Fraction
 
 from ._exact import Root, cmp_tval, frac_to_decimal, sorted_unique, tval_to_float
@@ -41,8 +41,12 @@ from ._types import (
     RayIntervalsResult,
     Source,
     Sphere,
+    Transform,
     Touch,
     Union,
+    _det3,
+    _identity3,
+    _mat_mul,
     _is_node,
 )
 
@@ -69,14 +73,15 @@ _BOX_NORMALS = {
 # ---------------------------------------------------------------------------
 
 def _validate_and_collect(tree):
-    """Check tree structure; return (leaves, polarities) in traversal order."""
+    """Check tree structure; collect leaves, polarities and world frames."""
     leaves = []
     polarities = []
+    frames = []
     seen_nodes = set()
     leaf_paths = {}
     count = 0
 
-    def walk(node, polarity, path):
+    def walk(node, polarity, path, matrix, translation):
         nonlocal count
         count += 1
         if count > MAX_TREE_NODES:
@@ -98,20 +103,71 @@ def _validate_and_collect(tree):
             leaf_paths[node.leaf_id] = path
             leaves.append(node)
             polarities.append(polarity)
+            frames.append((matrix, translation, _inverse3(matrix)))
         elif isinstance(node, (Union, Intersection)):
             for i, child in enumerate(node.children):
-                walk(child, polarity, f"{path}.children[{i}]")
+                walk(
+                    child, polarity, f"{path}.children[{i}]",
+                    matrix, translation,
+                )
         elif isinstance(node, Difference):
-            walk(node.positive, polarity, f"{path}.positive")
+            walk(node.positive, polarity, f"{path}.positive", matrix, translation)
             for i, sub in enumerate(node.subtractors):
-                walk(sub, -polarity, f"{path}.subtractors[{i}]")
+                walk(
+                    sub, -polarity, f"{path}.subtractors[{i}]",
+                    matrix, translation,
+                )
+        elif isinstance(node, Transform):
+            child_matrix = _mat_mul(matrix, node.matrix)
+            child_translation = tuple(
+                translation[i]
+                + sum(matrix[i][k] * node.translation[k] for k in range(3))
+                for i in range(3)
+            )
+            walk(
+                node.child, polarity, f"{path}.child",
+                child_matrix, child_translation,
+            )
         else:
             raise GeometryError(
                 f"{path}: not a CSG node ({type(node).__name__})"
             )
 
-    walk(tree, 1, "tree")
-    return leaves, polarities
+    walk(tree, 1, "tree", _identity3(), (Fraction(0),) * 3)
+    return leaves, polarities, frames
+
+
+def _inverse3(matrix):
+    """Exact inverse of a validated invertible 3x3 Fraction matrix."""
+    determinant = _det3(matrix)
+    cofactors = []
+    for i in range(3):
+        row = []
+        for j in range(3):
+            minor = [
+                [matrix[r][c] for c in range(3) if c != j]
+                for r in range(3) if r != i
+            ]
+            cofactor = minor[0][0] * minor[1][1] - minor[0][1] * minor[1][0]
+            row.append(cofactor * (1 if (i + j) % 2 == 0 else -1))
+        cofactors.append(row)
+    return tuple(
+        tuple(cofactors[j][i] / determinant for j in range(3))
+        for i in range(3)
+    )
+
+
+def _apply_matrix(matrix, point):
+    return tuple(sum(matrix[i][j] * point[j] for j in range(3)) for i in range(3))
+
+
+def _to_local_ray(frame, origin, direction):
+    _matrix, _translation, inverse = frame
+    local_origin = _apply_matrix(
+        inverse, tuple(origin[i] - _translation[i] for i in range(3))
+    )
+    local_direction = _apply_matrix(inverse, direction)
+    return local_origin, local_direction
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +324,8 @@ def _make_evaluator(tree, leaf_index):
             for sub in node.subtractors:
                 result = _sub_state(result, evaluate(sub, leaf_state))
             return result
+        if isinstance(node, Transform):
+            return evaluate(node.child, leaf_state)
         raise GeometryError(f"tree: not a CSG node ({type(node).__name__})")
 
     return evaluate
@@ -277,27 +335,65 @@ def _make_evaluator(tree, leaf_index):
 # normals
 # ---------------------------------------------------------------------------
 
-def _sphere_normal(sphere, origin, direction, tval):
-    """Outward unit normal at the hit point (exact when tval is rational)."""
+def _sqrt_fraction_value(value):
+    num_root = math.isqrt(value.numerator)
+    den_root = math.isqrt(value.denominator)
+    if num_root * num_root == value.numerator and den_root * den_root == value.denominator:
+        return Fraction(num_root, den_root)
+    return None
+
+
+def _world_normal(leaf, face, frame, local_origin, local_direction, tval):
+    """Map a local outward covector to world coordinates and normalize it."""
+    matrix, _translation, inverse = frame
     if isinstance(tval, Fraction):
-        normal = [
-            (origin[i] + tval * direction[i] - sphere.center[i]) / sphere.radius
-            for i in range(3)
-        ]
-        return tuple(float(component) for component in normal)
+        if isinstance(leaf, Sphere):
+            local = tuple(
+                (
+                    local_origin[i]
+                    + tval * local_direction[i]
+                    - leaf.center[i]
+                )
+                / leaf.radius
+                for i in range(3)
+            )
+        else:
+            local = tuple(Fraction(component) for component in _BOX_NORMALS[face])
+        covector = tuple(
+            sum(inverse[j][i] * local[j] for j in range(3)) for i in range(3)
+        )
+        length_squared = sum(component * component for component in covector)
+        length = _sqrt_fraction_value(length_squared)
+        if length is not None:
+            return tuple(float(component / length) for component in covector)
+        with localcontext() as ctx:
+            ctx.prec = 70
+            length_dec = sum(frac_to_decimal(v) ** 2 for v in covector).sqrt()
+            return tuple(
+                float(frac_to_decimal(v) / length_dec) for v in covector
+            )
+
     with localcontext() as ctx:
         ctx.prec = 70
-        t_dec = tval.decimal(70)
-        normal = [
-            (
-                frac_to_decimal(origin[i])
-                + t_dec * frac_to_decimal(direction[i])
-                - frac_to_decimal(sphere.center[i])
+        if isinstance(leaf, Sphere):
+            t_dec = tval.decimal(70)
+            local = tuple(
+                (
+                    frac_to_decimal(local_origin[i])
+                    + t_dec * frac_to_decimal(local_direction[i])
+                    - frac_to_decimal(leaf.center[i])
+                )
+                / frac_to_decimal(leaf.radius)
+                for i in range(3)
             )
-            / frac_to_decimal(sphere.radius)
+        else:
+            local = tuple(Decimal(component) for component in _BOX_NORMALS[face])
+        covector = tuple(
+            sum(frac_to_decimal(inverse[j][i]) * local[j] for j in range(3))
             for i in range(3)
-        ]
-        return tuple(float(component) for component in normal)
+        )
+        length = sum(v * v for v in covector).sqrt()
+        return tuple(float(v / length) for v in covector)
 
 
 # ---------------------------------------------------------------------------
@@ -318,17 +414,20 @@ def ray_intervals(tree, ray):
     origin = ray.origin
     direction = ray.direction
 
-    leaves, polarities = _validate_and_collect(tree)
+    leaves, polarities, frames = _validate_and_collect(tree)
     leaf_index = {id(leaf): i for i, leaf in enumerate(leaves)}
     evaluate = _make_evaluator(tree, leaf_index)
 
     # -- per-leaf events -------------------------------------------------
     leaf_events = []
-    for leaf in leaves:
+    local_rays = []
+    for leaf, frame in zip(leaves, frames):
+        local_origin, local_direction = _to_local_ray(frame, origin, direction)
+        local_rays.append((local_origin, local_direction))
         if isinstance(leaf, Sphere):
-            leaf_events.append(_sphere_events(leaf, origin, direction))
+            leaf_events.append(_sphere_events(leaf, local_origin, local_direction))
         else:
-            leaf_events.append(_box_events(leaf, origin, direction))
+            leaf_events.append(_box_events(leaf, local_origin, local_direction))
 
     # -- exact clustering of coincident event parameters -----------------
     all_tvals = [tval for events in leaf_events for (tval, _kind, _faces) in events]
@@ -472,8 +571,8 @@ def ray_intervals(tree, ray):
                 for face in faces:
                     found.append(
                         _make_source(
-                            leaf, face, source_kind, clusters[ci],
-                            origin, direction, polarities[li],
+                            leaf, face, source_kind, clusters[ci], frames[li],
+                            local_rays[li][0], local_rays[li][1], polarities[li],
                         )
                     )
         found.sort(key=lambda s: (s.leaf_id, s.face))
@@ -567,11 +666,10 @@ def ray_intervals(tree, ray):
     )
 
 
-def _make_source(leaf, face, kind, tval, origin, direction, polarity):
-    if isinstance(leaf, Sphere):
-        normal = _sphere_normal(leaf, origin, direction, tval)
-    else:
-        normal = _BOX_NORMALS[face]
+def _make_source(leaf, face, kind, tval, frame, local_origin, local_direction, polarity):
+    normal = _world_normal(
+        leaf, face, frame, local_origin, local_direction, tval
+    )
     flipped = polarity < 0
     if flipped:
         normal = tuple(-component for component in normal)

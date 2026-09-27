@@ -16,7 +16,11 @@ from csg_rays import (
     GeometryError,
     Intersection,
     Ray,
+    Rotate,
+    Scale,
     Sphere,
+    Transform,
+    Translate,
     Union,
     ray_intervals,
 )
@@ -193,6 +197,113 @@ class TestCoincidentEvents(unittest.TestCase):
         self.assertEqual(res.intervals, ())
         self.assertEqual(res.boundaries, ())
         self.assertEqual(res.touches, ())
+
+
+class TestTransforms(unittest.TestCase):
+    def test_translate_subtree_without_rewriting_leaf(self):
+        tree = Translate(Box((0, 0, 0), (1, 1, 1), "b"), (10, 0, 0))
+        res = ray_intervals(tree, Ray((-1, 0.5, 0.5), (1, 0, 0)))
+        self.assertEqual([(iv.t0, iv.t1) for iv in res.intervals], [(11.0, 12.0)])
+        enter, exit_ = res.boundaries
+        self.assertEqual(enter.source.normal, (-1.0, 0.0, 0.0))
+        self.assertEqual(exit_.source.normal, (1.0, 0.0, 0.0))
+
+    def test_identity_transform_preserves_intervals_and_boundaries(self):
+        ray = Ray((-10, 0, 0), (1, 0, 0))
+        tree = Difference(
+            Sphere((0, 0, 0), 5, "outer"),
+            Sphere((0, 0, 0), 2, "inner"),
+        )
+        plain = ray_intervals(tree, ray)
+        transformed = ray_intervals(
+            Transform(
+                tree,
+                matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+                translation=(0, 0, 0),
+            ),
+            ray,
+        )
+        self.assertEqual(
+            [(iv.t0, iv.t1) for iv in transformed.intervals],
+            [(iv.t0, iv.t1) for iv in plain.intervals],
+        )
+        self.assertEqual(
+            [b.t for b in transformed.boundaries],
+            [b.t for b in plain.boundaries],
+        )
+        self.assertEqual(
+            [s.normal for b in transformed.boundaries for s in b.sources],
+            [s.normal for b in plain.boundaries for s in b.sources],
+        )
+
+    def test_quarter_rotation(self):
+        # Local box x in [0,2] rotates to world y in [0,2]; local y width 1
+        # becomes world x in [-1,0].
+        tree = Rotate(Box((0, 0, 0), (2, 1, 1), "b"), math.pi / 2, (0, 0, 1))
+        res = ray_intervals(tree, Ray((-5, 0.5, 0.5), (1, 0, 0)))
+        self.assertEqual([(iv.t0, iv.t1) for iv in res.intervals], [(4.0, 5.0)])
+        enter, exit_ = res.boundaries
+        self.assertEqual(enter.source.normal, (-1.0, 0.0, 0.0))
+        self.assertEqual(exit_.source.normal, (1.0, 0.0, 0.0))
+
+    def test_nonuniform_scale_ellipsoid_normals(self):
+        tree = Scale(Sphere((0, 0, 0), 1, "s"), (2, 1, 1))
+        res = ray_intervals(tree, Ray((0, -5, 0), (0, 1, 0)))
+        self.assertEqual([(iv.t0, iv.t1) for iv in res.intervals], [(4.0, 6.0)])
+        self.assertEqual(res.boundaries[0].source.normal, (0.0, -1.0, 0.0))
+        self.assertEqual(res.boundaries[1].source.normal, (0.0, 1.0, 0.0))
+
+        # Ray x=y through ellipsoid x^2/4+y^2=1: 5t^2/4=1, t=2/sqrt(5).
+        res = ray_intervals(tree, Ray((0, 0, 0), (1, 1, 0)))
+        endpoint = 2.0 / math.sqrt(5.0)
+        self.assertAlmostEqual(res.intervals[0].t0, -endpoint, places=12)
+        self.assertAlmostEqual(res.intervals[0].t1, endpoint, places=12)
+        normal = res.boundaries[1].source.normal
+        expected = (1.0 / math.sqrt(17.0), 4.0 / math.sqrt(17.0), 0.0)
+        for got, wanted in zip(normal, expected):
+            self.assertAlmostEqual(got, wanted, places=12)
+
+    def test_nested_transforms_compose(self):
+        # Translate the unit box to local y [2,3], then rotate by +90 around
+        # z: it occupies world x in [-3,-2].
+        tree = Rotate(
+            Translate(Box((0, 0, 0), (1, 1, 1), "b"), (0, 2, 0)),
+            math.pi / 2,
+            (0, 0, 1),
+        )
+        res = ray_intervals(tree, Ray((0, 0.5, 0.5), (-1, 0, 0)))
+        self.assertEqual([(iv.t0, iv.t1) for iv in res.intervals], [(2.0, 3.0)])
+
+    def test_transformed_subtractor_normal_is_flipped(self):
+        tree = Difference(
+            Sphere((0, 0, 0), 5, "outer"),
+            Translate(Sphere((0, 0, 0), 1, "inner"), (3, 0, 0)),
+        )
+        res = ray_intervals(tree, Ray((-10, 0, 0), (1, 0, 0)))
+        self.assertEqual([(iv.t0, iv.t1) for iv in res.intervals], [(5.0, 12.0), (14.0, 15.0)])
+        cavity_exit = res.boundaries[1]
+        cavity_enter = res.boundaries[2]
+        self.assertTrue(cavity_exit.source.flipped)
+        self.assertTrue(cavity_enter.source.flipped)
+        self.assertEqual(cavity_exit.source.normal, (1.0, 0.0, 0.0))
+        self.assertEqual(cavity_enter.source.normal, (-1.0, 0.0, 0.0))
+
+    def test_explicit_affine_matrix_and_singular_rejection(self):
+        tree = Transform(
+            Box((0, 0, 0), (1, 1, 1), "b"),
+            matrix=((2, 0, 0), (0, 1, 0), (0, 0, 1)),
+            translation=(0, 5, 0),
+        )
+        res = ray_intervals(tree, Ray((1, 0, 0.5), (0, 1, 0)))
+        self.assertEqual([(iv.t0, iv.t1) for iv in res.intervals], [(5.0, 6.0)])
+        with self.assertRaises(GeometryError) as ctx:
+            Transform(
+                Box((0, 0, 0), (1, 1, 1), "b"),
+                matrix=((1, 0, 0), (0, 1, 0), (1, 1, 0)),
+            )
+        self.assertIn("singular", str(ctx.exception))
+        with self.assertRaises(GeometryError):
+            Scale(Sphere((0, 0, 0), 1, "s"), (1, 0, 1))
 
 
 class TestInputValidation(unittest.TestCase):

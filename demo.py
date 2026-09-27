@@ -7,7 +7,19 @@ probed by two rays, followed by two genuinely triggered input rejections.
 Run:  python demo.py     (finishes in well under 8 seconds)
 """
 
-from csg_rays import Difference, GeometryError, Ray, Sphere, ray_intervals
+from math import pi
+
+from csg_rays import (
+    Difference,
+    GeometryError,
+    Ray,
+    Rotate,
+    Scale,
+    Sphere,
+    Transform,
+    Translate,
+    ray_intervals,
+)
 
 
 def show(result, label):
@@ -56,7 +68,20 @@ def main():
     show(res2, "ray starting inside the cavity, origin (0,0,0)")
     print()
 
-    # 3) Two genuinely triggered rejections (invalid input is not corrected).
+    # 3) A nested transform subtracts an ellipsoid cavity without rewriting
+    #    the unit sphere leaf: scale locally, then translate it.
+    transformed_hollow = Difference(
+        Sphere((0, 0, 0), 6, "outer"),
+        Translate(
+            Rotate(Scale(Sphere((0, 0, 0), 1, "ellipsoid"), (3, 1, 1)), pi, (0, 0, 1)),
+            (1, 0, 0),
+        ),
+    )
+    res3 = ray_intervals(transformed_hollow, Ray((-10, 0, 0), (1, 0, 0)))
+    show(res3, "nested translated/non-uniform-scaled spherical cavity")
+    print()
+
+    # 4) Two genuinely triggered rejections (invalid input is not corrected).
     print("--- invalid input rejections ---")
     try:
         Ray((0, 0, 0), (0, 0, 0))
@@ -66,6 +91,13 @@ def main():
         Sphere((0, 0, 0), float("nan"), "bad")
     except GeometryError as exc:
         print(f"  NaN radius rejected:   {exc}")
+    try:
+        Transform(
+            Sphere((0, 0, 0), 1, "bad"),
+            matrix=((1, 0, 0), (0, 1, 0), (1, 1, 0)),
+        )
+    except GeometryError as exc:
+        print(f"  singular transform:    {exc}")
 
 
 if __name__ == "__main__":

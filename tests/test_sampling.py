@@ -19,7 +19,11 @@ from csg_rays import (
     Difference,
     Intersection,
     Ray,
+    Rotate,
+    Scale,
     Sphere,
+    Transform,
+    Translate,
     Union,
     ray_intervals,
 )
@@ -59,7 +63,41 @@ def ref_inside(node, p, closed=False):
         if not ref_inside(node.positive, p, closed):
             return False
         return not any(ref_inside(s, p, closed=True) for s in node.subtractors)
+    if isinstance(node, Transform):
+        inverse = _inverse3(node.matrix)
+        local = tuple(
+            sum(inverse[i][j] * (p[j] - node.translation[j]) for j in range(3))
+            for i in range(3)
+        )
+        return ref_inside(node.child, local, closed)
     raise AssertionError("unknown node")
+
+
+def _det3(m):
+    return (
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    )
+
+
+def _inverse3(m):
+    d = _det3(m)
+    cofactors = []
+    for i in range(3):
+        row = []
+        for j in range(3):
+            minor = [
+                [m[r][c] for c in range(3) if c != j]
+                for r in range(3) if r != i
+            ]
+            value = minor[0][0] * minor[1][1] - minor[0][1] * minor[1][0]
+            row.append(value if (i + j) % 2 == 0 else -value)
+        cofactors.append(row)
+    return tuple(
+        tuple(cofactors[j][i] / d for j in range(3))
+        for i in range(3)
+    )
 
 
 def _point_at(origin, direction, t_float):
@@ -94,7 +132,29 @@ def _random_tree(rng, depth, id_counter):
         mins = tuple(rng.randint(-3, 2) for _ in range(3))
         maxs = tuple(m + rng.randint(1, 3) for m in mins)
         return Box(mins, maxs, leaf_id)
-    op = rng.choice("uid")
+    op = rng.choice("uidt")
+    if op == "t":
+        child = _random_tree(rng, depth - 1, id_counter)
+        kind = rng.randrange(4)
+        if kind == 0:
+            offset = tuple(rng.randint(-3, 3) for _ in range(3))
+            return Translate(child, offset)
+        if kind == 1:
+            return Rotate(child, rng.choice((0, 1, 2, 3)) * 1, (0, 0, 1))
+        if kind == 2:
+            factors = tuple(rng.choice((-2, -1, 1, 2, 3)) for _ in range(3))
+            return Scale(child, factors)
+        matrix = tuple(
+            tuple(rng.choice((-1, 0, 1)) for _ in range(3))
+            for _ in range(3)
+        )
+        while _det3(matrix) == 0:
+            matrix = tuple(
+                tuple(rng.choice((-1, 0, 1)) for _ in range(3))
+                for _ in range(3)
+            )
+        translation = tuple(rng.randint(-2, 2) for _ in range(3))
+        return Transform(child, matrix, translation)
     count = rng.randint(2, 3)
     subs = [_random_tree(rng, depth - 1, id_counter) for _ in range(count)]
     if op == "u":
